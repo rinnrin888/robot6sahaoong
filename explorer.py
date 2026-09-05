@@ -1,134 +1,91 @@
 # -*- coding: utf-8 -*-
 """
-explorer.py — Autonomous Unknown Maze Exploration & Exit Finder for Lab 6.
-Uses Edge-based MazeWalls + Frontier-based Exploration + DFS/BFS Backtracking.
+explorer.py — A* Planner for Autonomous Maze Exploration & Goal Navigation.
+Logic matches a_star_planner() from occupancy_grid_mapping.py exactly.
+
+Modes:
+  - "explore": find shortest path to nearest unvisited cell
+  - "goal":    find shortest path to a specific goal cell
+
+Edge costs:
+  - open (1):    1.0
+  - unknown (0): 5.0 (allow risky exploration)
+  - wall (-1):   blocked (not traversable)
+
+Turn penalties:
+  - straight:    0.0
+  - 90 turn:     0.8
+  - 180 u-turn:  1.5
 """
 
-from collections import deque
+import heapq
 import config
 
+GRID_SIZE = config.GRID_WIDTH   # 4
+DIRS = [(0, 1), (1, 0), (0, -1), (-1, 0)]  # N, E, S, W
+DIR_NAMES = ['NORTH', 'EAST', 'SOUTH', 'WEST']
 
-class AutonomousExplorer:
+
+def a_star_planner(ogm, start_x, start_y, start_heading, target_mode="explore", target_pos=None):
     """
-    ระบบนำทางสำรวจเขาวงกตที่ไม่รู้แผนที่มาก่อนเพื่อหาทางออก (Exit):
-      - ใช้ข้อมูลกำแพงรอบด้าน (North, East, South, West) จาก MazeWalls
-      - สำรวจช่องว่างที่ยังไม่เคยเดิน (Unvisited Frontiers) โดยมุ่งหน้าไปยังทิศของทางออก
-      - มีระบบ Backtrack อัตโนมัติเมื่อเจอทางตัน (Dead End)
-      - เมื่อแผนที่เปิดทางจนพบเส้นทางตรงไปยังทางออก จะเดินเข้าสู่ทางออกทันที
+    A* pathfinding matching occupancy_grid_mapping.py logic.
+
+    Args:
+        ogm:            OccupancyGridMap instance (with .edges, .visited)
+        start_x, start_y: current robot position
+        start_heading:  heading index (0=N, 1=E, 2=S, 3=W)
+        target_mode:    "explore" (find unvisited cell) or "goal" (go to target_pos)
+        target_pos:     (x, y) tuple for "goal" mode
+
+    Returns:
+        list of (x, y) from start to target, or None if no path found.
     """
+    pq = [(0, start_x, start_y, start_heading, [(start_x, start_y)])]
+    visited_states = set()
 
-    def __init__(self, exit_cell=config.EXIT_CELL):
-        self.exit_cell = exit_cell
-        self.visited_cells = set()
+    while pq:
+        cost, cx, cy, c_head, path = heapq.heappop(pq)
 
-    def set_exit_cell(self, new_exit):
-        """เปลี่ยนตำแหน่งทางออกเป้าหมาย"""
-        self.exit_cell = tuple(new_exit)
-
-    def mark_visited(self, x, y):
-        """บันทึกว่าช่อง (x, y) ได้รับการสำรวจแล้ว"""
-        self.visited_cells.add((x, y))
-
-    def reset_visited(self):
-        """ล้างประวัติการสำรวจ"""
-        self.visited_cells.clear()
-
-    def is_at_exit(self, x, y):
-        """ตรวจสอบว่าถึงทางออกหรือยัง"""
-        return (x, y) == self.exit_cell
-
-    def get_adjacent_neighbors(self, x, y):
-        """คืนค่า 4 ช่องรอบข้าง (North, East, South, West)"""
-        return [
-            (x, y + 1, "NORTH", 0),
-            (x + 1, y, "EAST", 90),
-            (x, y - 1, "SOUTH", 180),
-            (x - 1, y, "WEST", 270)
-        ]
-
-    def bfs_shortest_path(self, start, target, maze_walls):
-        """
-        หาเส้นทางสั้นที่สุดจากจุด start ไปยัง target ผ่านขอบที่ไม่มีกำแพงกั้น
-        คืนค่า: list ของ (x, y)
-        """
-        if start == target:
-            return [start]
-
-        queue = deque([[start]])
-        visited = {start}
-
-        while queue:
-            path = queue.popleft()
-            cx, cy = path[-1]
-
-            if (cx, cy) == target:
+        if target_mode == "explore":
+            # Target: any unvisited cell (not the start itself)
+            if (cx, cy) not in ogm.visited and (cx, cy) != (start_x, start_y):
+                return path
+        else:
+            # Target: specific goal position
+            if (cx, cy) == target_pos:
                 return path
 
-            for nx, ny, dir_name, _ in self.get_adjacent_neighbors(cx, cy):
-                if (nx, ny) not in visited:
-                    # ตรวจสอบว่าขอบกั้นระหว่าง (cx, cy) และ (nx, ny) ไม่ถูกบล็อกด้วยกำแพง
-                    if maze_walls.can_move(cx, cy, dir_name):
-                        visited.add((nx, ny))
-                        queue.append(path + [(nx, ny)])
+        state = (cx, cy, c_head)
+        if state in visited_states:
+            continue
+        visited_states.add(state)
 
-        return None
+        for d_idx in range(4):
+            nx, ny = cx + DIRS[d_idx][0], cy + DIRS[d_idx][1]
+            if 0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE:
+                e_stat = ogm.get_edge((cx, cy), (nx, ny))
+                if e_stat != -1:  # Not a confirmed wall
+                    # Known open edge = 1.0, unknown = 5.0 (risky but allowed)
+                    move_cost = 1.0 if e_stat == 1 else 5.0
+                    turn_diff = (d_idx - c_head) % 4
+                    turn_penalty = 0.0 if turn_diff == 0 else (1.5 if turn_diff == 2 else 0.8)
 
-    def find_direct_path_to_exit(self, current, maze_walls):
-        """ถ้ามีเส้นทางที่รู้จักแล้วเชื่อมไปยังทางออก ให้คืนเส้นทางนั้น"""
-        return self.bfs_shortest_path(current, self.exit_cell, maze_walls)
+                    new_cost = cost + move_cost + turn_penalty
+                    h = abs(target_pos[0] - nx) + abs(target_pos[1] - ny) if target_pos else 0
 
-    def decide_next_move(self, current, maze_walls):
-        """
-        ตัดสินใจเลือกช่องถัดไปที่ต้องเดิน:
-        คืนค่า: (next_cell, decision_reason)
-        """
-        cx, cy = current
-        self.mark_visited(cx, cy)
+                    heapq.heappush(pq, (new_cost + h, nx, ny, d_idx, path + [(nx, ny)]))
 
-        # 1. ถึงทางออกแล้ว
-        if self.is_at_exit(cx, cy):
-            return None, "GOAL_REACHED"
+    return None
 
-        # 2. เช็คว่ามีทางเคลียร์ไปยังทางออกผ่านช่องและขอบเปิดหรือยัง
-        direct_path = self.find_direct_path_to_exit(current, maze_walls)
-        if direct_path and len(direct_path) > 1:
-            next_step = direct_path[1]
-            return next_step, f"EXIT_PATH_FOUND -> เดินตรงสู่เป้าหมาย {self.exit_cell}"
 
-        # 3. หาช่องติดกันที่ยังไม่เคยเดิน และไม่มีกำแพงกั้น (Unvisited Walkable Neighbors)
-        unvisited_candidates = []
-        for nx, ny, dir_name, _ in self.get_adjacent_neighbors(cx, cy):
-            if (nx, ny) not in self.visited_cells and maze_walls.can_move(cx, cy, dir_name):
-                # คำนวณระยะห่างไปยังทางออก (Manhattan distance heuristic)
-                dist_to_exit = abs(nx - self.exit_cell[0]) + abs(ny - self.exit_cell[1])
-                unvisited_candidates.append((dist_to_exit, (nx, ny), dir_name))
+def heading_deg_to_idx(heading_deg):
+    """Convert heading degrees (0/90/180/270) to direction index (0/1/2/3).
+    0° (North) -> 0, 90° (East) -> 1, 180° (South) -> 2, 270° (West) -> 3"""
+    norm = int(round(heading_deg / 90.0) * 90) % 360
+    return {0: 0, 90: 1, 180: 2, 270: 3}.get(norm, 0)
 
-        # ถ้ามีช่องรอบข้างที่ยังไม่เคยสำรวจ ให้เลือกช่องที่ใกล้ทางออกที่สุด
-        if unvisited_candidates:
-            unvisited_candidates.sort(key=lambda item: item[0])
-            best_cell = unvisited_candidates[0][1]
-            dir_name = unvisited_candidates[0][2]
-            return best_cell, f"EXPLORE_NEW -> สำรวจขอบทางใหม่ ({best_cell[0]},{best_cell[1]}) ทิศ {dir_name}"
 
-        # 4. หากเจอทางตัน (Dead End): ทุกด้านรอบตัวมีกำแพงกั้นหรือสำรวจครบแล้ว -> ทำการ Backtrack
-        nearest_branch = None
-        shortest_branch_path = None
-
-        for cell in self.visited_cells:
-            has_unvisited = any(
-                (nx, ny) not in self.visited_cells and maze_walls.can_move(cell[0], cell[1], dir_name)
-                for nx, ny, dir_name, _ in self.get_adjacent_neighbors(cell[0], cell[1])
-            )
-            if has_unvisited:
-                path = self.bfs_shortest_path(current, cell, maze_walls)
-                if path:
-                    if shortest_branch_path is None or len(path) < len(shortest_branch_path):
-                        shortest_branch_path = path
-                        nearest_branch = cell
-
-        if shortest_branch_path and len(shortest_branch_path) > 1:
-            next_step = shortest_branch_path[1]
-            return next_step, f"DEAD_END_BACKTRACK -> ถอยกลับไปหาทางแยกที่ {nearest_branch}"
-
-        # 5. หากสำรวจจนครบทุกเส้นทางแล้วไม่พบทางออก
-        return None, "MAZE_EXHAUSTED"
+def heading_idx_to_deg(heading_idx):
+    """Convert direction index (0/1/2/3) to heading degrees.
+    0 -> 0° (North), 1 -> 90° (East), 2 -> 180° (South), 3 -> 270° (West)"""
+    return [0, 90, 180, 270][heading_idx % 4]

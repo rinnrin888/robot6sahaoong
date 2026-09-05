@@ -3,15 +3,15 @@
 dashboard.py -- Interactive Real-Time Dashboard for Lab 6.
 
 Phase 1 (SETUP):
-  - User clicks START cell (green) and EXIT cell (cyan) on the 4x4 grid.
-  - Buttons: [SET START] [SET EXIT] [START EXPLORATION]
+  - User clicks START cell (green) and GOAL cell (cyan) on the 4x4 grid.
+  - Buttons: [SET START] [SET GOAL] [START EXPLORATION]
   - Robot does NOT move yet.
 
 Phase 2 (RUNNING):
-  - Full telemetry: wall edges, sensor bars, AI status, speed config.
-  - Buttons: EXPLORE, STEP FWD, TURN L/R, SCAN, SAVE.
+  - Full telemetry: wall edges from ogm.get_edge(), sensor bars, AI status.
+  - Buttons: EXPLORE, STEP FWD, TURN L/R, SAVE.
   - Live speed/threshold config via +/- buttons.
-  - Click grid cell -> change exit target.
+  - Click grid cell -> change goal target.
 """
 
 import math
@@ -23,32 +23,30 @@ import config
 C_BG_DARK    = (24,  20,  18)
 C_BG_PANEL   = (38,  30,  26)
 C_BG_CELL    = (34,  28,  26)
-C_BG_VISITED = (46,  40,  35)
 C_WALL_CONF  = (40,  40, 220)
-C_WALL_LIKE  = (40, 120, 230)
 C_OPEN       = (50, 180,  50)
 C_UNKNOWN    = (70,  60,  55)
 C_BORDER     = (200,  60,  30)
 C_ROBOT      = (0,  140, 255)
-C_ARROW      = (0,  255, 255)
-C_TRAJ       = (0,  200, 255)
-C_START      = (0,  200, 100)
-C_EXIT_C     = (0,  215, 255)
 C_HEADER     = (240, 240, 240)
 C_ACCENT     = (0,  215, 255)
 C_BTN_GREEN  = (40, 120,  50)
 C_BTN_BLUE   = (50,  80, 130)
 C_BTN_GRAY   = (55,  48,  42)
 C_BTN_WARN   = (30,  80, 160)
-C_BTN_START  = (20, 160,  20)
 C_BTN_ACT    = (0,  200, 100)
+C_START      = (0,  200, 100)
+C_GOAL_C     = (0,  215, 255)
+
+# Golden Yellow #FDCB6E in BGR (matching occupancy_grid_mapping.py)
+C_GOLDEN_WALL = (110, 203, 253)
 
 
 class InteractiveDashboard:
     """Interactive real-time dashboard.  Two phases: SETUP and RUNNING."""
 
     # ── Construction ──────────────────────────────────────────────────────────
-    def __init__(self, window_name="RoboMaster Lab6 -- Wall Map & Explorer"):
+    def __init__(self, window_name="RoboMaster Lab6 -- A* OGM Explorer"):
         self.window_name = window_name
         self.W, self.H = 1060, 700
         self.enabled = True
@@ -60,17 +58,16 @@ class InteractiveDashboard:
 
         # ── Phase: "SETUP" or "RUNNING" ──────────────────────────────────────
         self.phase = "SETUP"
-        self.set_target = "EXIT"          # which cell is being placed: "START" or "EXIT"
-        self.start_cell = (0, 0)          # chosen by user in SETUP
-        self.exit_cell  = config.EXIT_CELL
-        self.robot_mode = None            # "REAL" or "MOCK" — chosen on setup screen
+        self.set_target = "GOAL"           # which cell is being placed: "START" or "GOAL"
+        self.start_cell = (0, 0)           # chosen by user in SETUP
+        self.goal_cell  = config.EXIT_CELL # Goal (formerly "exit")
+        self.robot_mode = None             # "REAL" or "MOCK"
 
         # ── Live config (RUNNING phase) ────────────────────────────────────────
         self.move_speed     = config.MOVE_SPEED_MPS
         self.turn_speed     = config.TURN_SPEED_DPS
         self.wall_detect_cm = config.WALL_DETECT_CM
         self.io_wall_value  = config.IO_WALL_VALUE
-        self.scan_passes    = 1           # 1-pass 360 scan (1 round)
 
         self.requested_action = None
         self.buttons = []
@@ -96,15 +93,15 @@ class InteractiveDashboard:
                             self.start_cell = (gx, gy)
                             print("[Setup] Start cell -> (%d,%d)" % (gx, gy))
                         else:
-                            self.exit_cell = (gx, gy)
+                            self.goal_cell = (gx, gy)
                             config.EXIT_CELL = (gx, gy)
-                            print("[Setup] Exit cell -> (%d,%d)" % (gx, gy))
+                            print("[Setup] Goal cell -> (%d,%d)" % (gx, gy))
                     else:
-                        # RUNNING: change exit target
-                        self.exit_cell = (gx, gy)
+                        # RUNNING: change goal target
+                        self.goal_cell = (gx, gy)
                         config.EXIT_CELL = (gx, gy)
-                        self.requested_action = "SET_EXIT_%d_%d" % (gx, gy)
-                        print("[Dashboard] Exit target -> (%d,%d)" % (gx, gy))
+                        self.requested_action = "SET_GOAL_%d_%d" % (gx, gy)
+                        print("[Dashboard] Goal target -> (%d,%d)" % (gx, gy))
                     return
 
         # Button click
@@ -114,14 +111,13 @@ class InteractiveDashboard:
                 return
 
     def _handle(self, action):
-        # Setup phase buttons
         if action == "SET_START_MODE":
             self.set_target = "START"
             print("[Setup] Click a cell to set START position")
             return
-        if action == "SET_EXIT_MODE":
-            self.set_target = "EXIT"
-            print("[Setup] Click a cell to set EXIT position")
+        if action == "SET_GOAL_MODE":
+            self.set_target = "GOAL"
+            print("[Setup] Click a cell to set GOAL position")
             return
         if action == "BTN_START_RUN":
             self.requested_action = "BTN_START_RUN"
@@ -149,9 +145,6 @@ class InteractiveDashboard:
         elif action == "IO_TOGGLE":
             self.io_wall_value = 1 if self.io_wall_value == 0 else 0
             config.IO_WALL_VALUE = self.io_wall_value
-        elif action == "TOGGLE_PASSES":
-            self.scan_passes = 1 if self.scan_passes == 2 else 2
-            print("[Dashboard] 360 Scan Passes -> %d" % self.scan_passes)
         else:
             self.requested_action = action
 
@@ -169,34 +162,6 @@ class InteractiveDashboard:
     def _cctr(self, gx, gy):
         x1, y1, x2, y2 = self._crect(gx, gy)
         return (x1 + x2) // 2, (y1 + y2) // 2
-
-    # ── Wall edge drawing ─────────────────────────────────────────────────────
-    def _wall_style(self, p):
-        if p >= 0.60:  return C_WALL_CONF, 7, False
-        if p >= 0.50:  return C_WALL_LIKE, 5, False
-        if p <= 0.40:  return C_OPEN, 2, True
-        return C_UNKNOWN, 1, False
-
-    def _draw_edge(self, canvas, pt1, pt2, p, outer=False):
-        if outer:
-            cv2.line(canvas, pt1, pt2, C_BORDER, 5, cv2.LINE_AA)
-            return
-        color, thick, dotted = self._wall_style(p)
-        x1, y1 = pt1; x2, y2 = pt2
-        if dotted:
-            dx, dy = x2 - x1, y2 - y1
-            L = max(abs(dx), abs(dy), 1)
-            step = 10
-            for i in range(0, L, step * 2):
-                t0 = i / L; t1 = min((i + step) / L, 1.0)
-                pa = (int(x1 + t0*dx), int(y1 + t0*dy))
-                pb = (int(x1 + t1*dx), int(y1 + t1*dy))
-                cv2.line(canvas, pa, pb, color, thick, cv2.LINE_AA)
-        else:
-            if x1 == x2:
-                cv2.line(canvas, (x1, y1+4), (x2, y2-4), color, thick, cv2.LINE_AA)
-            else:
-                cv2.line(canvas, (x1+4, y1), (x2-4, y2), color, thick, cv2.LINE_AA)
 
     # ── UI helpers ────────────────────────────────────────────────────────────
     def _title(self, c, px, py, txt):
@@ -223,7 +188,7 @@ class InteractiveDashboard:
 
     # ── SETUP PHASE render ────────────────────────────────────────────────────
     def render_setup(self):
-        """Draw the setup screen: pick start & exit, then press RUN."""
+        """Draw the setup screen: pick start & goal, then press RUN."""
         if not self.enabled:
             return
         canvas = np.full((self.H, self.W, 3), C_BG_DARK, dtype=np.uint8)
@@ -231,7 +196,7 @@ class InteractiveDashboard:
 
         # Header
         cv2.rectangle(canvas, (0,0), (self.W, 46), (38,30,26), -1)
-        cv2.putText(canvas, "ROBOMASTER EP | LAB 6: SETUP -- Choose Start & Exit, then press RUN",
+        cv2.putText(canvas, "ROBOMASTER EP | LAB 6: SETUP -- Choose Start (S) & Goal (G)",
                     (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.58, C_HEADER, 2, cv2.LINE_AA)
         cv2.putText(canvas, "[ SETUP ]", (self.W-140, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255,200,60), 2, cv2.LINE_AA)
@@ -240,24 +205,22 @@ class InteractiveDashboard:
         for gy in range(4):
             for gx in range(4):
                 x1, y1, x2, y2 = self._crect(gx, gy)
-                # Highlight selected cells
                 if (gx, gy) == self.start_cell:
                     cv2.rectangle(canvas, (x1+1,y1+1), (x2-1,y2-1), (20,60,20), -1)
                     cv2.rectangle(canvas, (x1+4,y1+4), (x2-4,y2-4), C_START, 3)
-                    cv2.putText(canvas, "START", (x1+8, y1+24),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.50, C_START, 2, cv2.LINE_AA)
-                elif (gx, gy) == self.exit_cell:
+                    cv2.putText(canvas, "START (S)", (x1+8, y1+24),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, C_START, 2, cv2.LINE_AA)
+                elif (gx, gy) == self.goal_cell:
                     cv2.rectangle(canvas, (x1+1,y1+1), (x2-1,y2-1), (20,50,60), -1)
-                    cv2.rectangle(canvas, (x1+4,y1+4), (x2-4,y2-4), C_EXIT_C, 3)
-                    cv2.putText(canvas, "EXIT", (x1+8, y1+24),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.50, C_EXIT_C, 2, cv2.LINE_AA)
+                    cv2.rectangle(canvas, (x1+4,y1+4), (x2-4,y2-4), C_GOAL_C, 3)
+                    cv2.putText(canvas, "GOAL (G)", (x1+8, y1+24),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, C_GOAL_C, 2, cv2.LINE_AA)
                 else:
                     cv2.rectangle(canvas, (x1+1,y1+1), (x2-1,y2-1), C_BG_CELL, -1)
 
-                # Hover-hint overlay
-                if self.set_target == "START" and (gx,gy) != self.start_cell and (gx,gy) != self.exit_cell:
+                if self.set_target == "START" and (gx,gy) != self.start_cell and (gx,gy) != self.goal_cell:
                     cv2.rectangle(canvas, (x1+2,y1+2), (x2-2,y2-2), (0,80,30), 1)
-                elif self.set_target == "EXIT" and (gx,gy) != self.start_cell and (gx,gy) != self.exit_cell:
+                elif self.set_target == "GOAL" and (gx,gy) != self.start_cell and (gx,gy) != self.goal_cell:
                     cv2.rectangle(canvas, (x1+2,y1+2), (x2-2,y2-2), (0,80,100), 1)
 
                 cv2.putText(canvas, "(%d,%d)" % (gx,gy), (x1+6, y2-8),
@@ -283,7 +246,7 @@ class InteractiveDashboard:
         cv2.rectangle(canvas, (px,52), (px+pw, self.H-10), C_BG_PANEL, -1)
         cv2.rectangle(canvas, (px,52), (px+pw, self.H-10), (70,60,55), 1)
 
-        # ── Step 0: Choose REAL or MOCK ────────────────────────────────────────
+        # Mode selection
         self._title(canvas, px, 78, "STEP 1: SELECT MODE")
         r_bg = (20,140,20)  if self.robot_mode == "REAL" else C_BTN_GRAY
         m_bg = (30, 80,160) if self.robot_mode == "MOCK" else C_BTN_GRAY
@@ -291,7 +254,6 @@ class InteractiveDashboard:
         m_tc = (255,255,255) if self.robot_mode == "MOCK" else (160,160,160)
         self._btn(canvas, px+14,  88, 192, 42, "REAL ROBOT (Wi-Fi)", "BTN_MODE_REAL", r_bg, text_col=r_tc)
         self._btn(canvas, px+214, 88, 180, 42, "SIMULATION",         "BTN_MODE_MOCK", m_bg, text_col=m_tc)
-        # Mode status label
         if self.robot_mode == "REAL":
             mode_lbl = "Mode: REAL ROBOT selected"
             mode_col = (80, 255, 80)
@@ -299,70 +261,66 @@ class InteractiveDashboard:
             mode_lbl = "Mode: SIMULATION selected"
             mode_col = (80, 180, 255)
         else:
-            mode_lbl = "<-- Please select a mode before starting"
+            mode_lbl = "<-- Please select a mode"
             mode_col = (80, 80, 200)
         cv2.putText(canvas, mode_lbl, (px+14, 148),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.46, mode_col, 2, cv2.LINE_AA)
         self._hline(canvas, px, pw, 162)
 
-        # ── Step 1: Set start & exit ────────────────────────────────────────────
-        self._title(canvas, px, 182, "STEP 2: CHOOSE START & EXIT CELLS")
+        # Start & Goal selection
+        self._title(canvas, px, 182, "STEP 2: CHOOSE START (S) & GOAL (G)")
         cv2.putText(canvas, "a. Click [SET START] then click a grid cell",
                     (px+14,208), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (220,220,220), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "b. Click [SET EXIT]  then click a grid cell",
+        cv2.putText(canvas, "b. Click [SET GOAL]  then click a grid cell",
                     (px+14,228), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (220,220,220), 1, cv2.LINE_AA)
         self._hline(canvas, px, pw, 242)
 
-        # Current selection
-        cv2.putText(canvas, "Start Cell : (%d, %d)" % self.start_cell,
+        cv2.putText(canvas, "Start (S): (%d, %d)" % self.start_cell,
                     (px+14,266), cv2.FONT_HERSHEY_SIMPLEX, 0.52, C_START, 2, cv2.LINE_AA)
-        cv2.putText(canvas, "Exit  Cell : (%d, %d)" % self.exit_cell,
-                    (px+14,294), cv2.FONT_HERSHEY_SIMPLEX, 0.52, C_EXIT_C, 2, cv2.LINE_AA)
+        cv2.putText(canvas, "Goal  (G): (%d, %d)" % self.goal_cell,
+                    (px+14,294), cv2.FONT_HERSHEY_SIMPLEX, 0.52, C_GOAL_C, 2, cv2.LINE_AA)
         self._hline(canvas, px, pw, 308)
 
-        # Toggle buttons (SET START / SET EXIT)
-        self._title(canvas, px, 328, "STEP 2 CONTINUED: CLICK TO SET CELL TYPE")
         s_bg = C_BTN_ACT if self.set_target == "START" else C_BTN_GRAY
-        e_bg = C_BTN_ACT if self.set_target == "EXIT"  else C_BTN_GRAY
-        self._btn(canvas, px+14,  342, 185, 38, "SET START POSITION", "SET_START_MODE", s_bg,
+        g_bg = C_BTN_ACT if self.set_target == "GOAL"  else C_BTN_GRAY
+        self._btn(canvas, px+14,  322, 185, 38, "SET START (S)", "SET_START_MODE", s_bg,
                   text_col=(255,255,255) if self.set_target=="START" else (180,180,180))
-        self._btn(canvas, px+208, 342, 185, 38, "SET EXIT POSITION",  "SET_EXIT_MODE",  e_bg,
-                  text_col=(255,255,255) if self.set_target=="EXIT"  else (180,180,180))
+        self._btn(canvas, px+208, 322, 185, 38, "SET GOAL  (G)", "SET_GOAL_MODE",  g_bg,
+                  text_col=(255,255,255) if self.set_target=="GOAL"  else (180,180,180))
 
-        # Active mode hint
-        hint = "Click a grid cell to place START" if self.set_target=="START" else "Click a grid cell to place EXIT"
-        hint_col = C_START if self.set_target=="START" else C_EXIT_C
-        cv2.putText(canvas, hint, (px+14, 398), cv2.FONT_HERSHEY_SIMPLEX, 0.46, hint_col, 1, cv2.LINE_AA)
-        self._hline(canvas, px, pw, 412)
+        hint = "Click a grid cell to place START (S)" if self.set_target=="START" else "Click a grid cell to place GOAL (G)"
+        hint_col = C_START if self.set_target=="START" else C_GOAL_C
+        cv2.putText(canvas, hint, (px+14, 378), cv2.FONT_HERSHEY_SIMPLEX, 0.46, hint_col, 1, cv2.LINE_AA)
+        self._hline(canvas, px, pw, 392)
 
         # Speed pre-config
-        self._title(canvas, px, 430, "STEP 3: PRE-CONFIGURE SPEED")
+        self._title(canvas, px, 410, "STEP 3: PRE-CONFIGURE SPEED")
         cv2.putText(canvas, "Forward: %.2f m/s" % self.move_speed,
-                    (px+14,458), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255,230,100), 2, cv2.LINE_AA)
-        self._btn(canvas, px+190,442,36,24," - ","SPEED_DOWN",C_BTN_GRAY)
-        self._btn(canvas, px+232,442,36,24," + ","SPEED_UP",  C_BTN_GRAY)
-        self._pbar(canvas,px+14,466,pw-28,8,self.move_speed/0.60,(80,200,80))
+                    (px+14,438), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255,230,100), 2, cv2.LINE_AA)
+        self._btn(canvas, px+190,422,36,24," - ","SPEED_DOWN",C_BTN_GRAY)
+        self._btn(canvas, px+232,422,36,24," + ","SPEED_UP",  C_BTN_GRAY)
+        self._pbar(canvas,px+14,446,pw-28,8,self.move_speed/0.60,(80,200,80))
         cv2.putText(canvas, "Turn:    %.0f deg/s" % self.turn_speed,
-                    (px+14,492), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255,230,100), 2, cv2.LINE_AA)
-        self._btn(canvas, px+190,476,36,24," - ","TURN_DOWN",C_BTN_GRAY)
-        self._btn(canvas, px+232,476,36,24," + ","TURN_UP",  C_BTN_GRAY)
-        self._pbar(canvas,px+14,500,pw-28,8,self.turn_speed/120.0,(80,180,220))
-        self._hline(canvas, px, pw, 516)
+                    (px+14,472), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255,230,100), 2, cv2.LINE_AA)
+        self._btn(canvas, px+190,456,36,24," - ","TURN_DOWN",C_BTN_GRAY)
+        self._btn(canvas, px+232,456,36,24," + ","TURN_UP",  C_BTN_GRAY)
+        self._pbar(canvas,px+14,480,pw-28,8,self.turn_speed/120.0,(80,180,220))
+        self._hline(canvas, px, pw, 496)
 
         # BIG START BUTTON
-        cv2.rectangle(canvas, (px+14,518), (px+pw-14,618), (20,120,20), -1)
-        cv2.rectangle(canvas, (px+14,518), (px+pw-14,618), (50,220,50), 3)
+        cv2.rectangle(canvas, (px+14,508), (px+pw-14,608), (20,120,20), -1)
+        cv2.rectangle(canvas, (px+14,508), (px+pw-14,608), (50,220,50), 3)
         cv2.putText(canvas, "START EXPLORATION",
-                    (px+50,568), cv2.FONT_HERSHEY_SIMPLEX, 0.80, (255,255,255), 3, cv2.LINE_AA)
-        cv2.putText(canvas, "Robot will begin moving after this",
-                    (px+60,596), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180,255,180), 1, cv2.LINE_AA)
-        self.buttons.append((px+14, 518, px+pw-14, 618, "BTN_START_RUN"))
+                    (px+50,556), cv2.FONT_HERSHEY_SIMPLEX, 0.80, (255,255,255), 3, cv2.LINE_AA)
+        cv2.putText(canvas, "Explore all, then navigate to GOAL",
+                    (px+48,584), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180,255,180), 1, cv2.LINE_AA)
+        self.buttons.append((px+14, 508, px+pw-14, 608, "BTN_START_RUN"))
 
         cv2.imshow(self.window_name, canvas)
         cv2.waitKey(1)
 
     # ── RUNNING PHASE render ──────────────────────────────────────────────────
-    def render(self, maze_walls, ogm, robot_x, robot_y, heading_deg, path_history,
+    def render(self, ogm, robot_x, robot_y, heading_deg, path_history,
                sensor_data=None, explorer_status="READY", mode_str="REAL ROBOT", step_count=0):
         if not self.enabled:
             return
@@ -371,73 +329,117 @@ class InteractiveDashboard:
 
         # Header
         cv2.rectangle(canvas, (0,0), (self.W, 46), (38,30,26), -1)
-        cv2.putText(canvas, "ROBOMASTER EP | LAB 6: EDGE-WALL MAP & AUTONOMOUS MAZE EXPLORER",
+        cv2.putText(canvas, "ROBOMASTER EP | LAB 6: A* OGM AUTONOMOUS EXPLORER",
                     (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.60, C_HEADER, 2, cv2.LINE_AA)
         mc = (60,200,70) if "REAL" in mode_str.upper() else (80,160,240)
         cv2.putText(canvas, "[ %s ]" % mode_str.upper(),
                     (self.W-200, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.58, mc, 2, cv2.LINE_AA)
 
-        # Grid cells
-        vis = set((p[0],p[1]) for p in path_history)
+        # Grid cells (styled matching occupancy_grid_mapping.py)
+        probs = ogm.get_probabilities() if ogm is not None else np.full((4, 4), 0.50)
         for gy in range(4):
             for gx in range(4):
                 x1, y1, x2, y2 = self._crect(gx, gy)
-                bg = C_BG_VISITED if (gx,gy) in vis else C_BG_CELL
-                cv2.rectangle(canvas, (x1+1,y1+1), (x2-1,y2-1), bg, -1)
-                cv2.putText(canvas, "(%d,%d)"%(gx,gy), (x1+6,y2-8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (110,100,95), 1, cv2.LINE_AA)
+                p_val = probs[gy, gx]
+
+                # Colors from occupancy_grid_mapping.py:
+                # OCC (#D63031) -> BGR (49, 48, 214)
+                # FREE (#00B894) -> BGR (148, 184, 0)
+                # UNK (#636E72) -> BGR (114, 110, 99)
+                if p_val >= config.THRESHOLD_OCC:
+                    bg = (49, 48, 214)
+                    t_col = (255, 255, 255)
+                    sub_lbl = "OCC"
+                elif p_val <= config.THRESHOLD_FREE:
+                    bg = (148, 184, 0)
+                    t_col = (45, 52, 54)
+                    sub_lbl = "FREE"
+                else:
+                    bg = (114, 110, 99)
+                    t_col = (255, 255, 255)
+                    sub_lbl = "UNK"
+
+                cv2.rectangle(canvas, (x1+1, y1+1), (x2-1, y2-1), bg, -1)
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), (45, 52, 54), 1)
+
+                cv2.putText(canvas, f"{p_val:.2f}", (x1 + 28, y1 + 65),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.72, t_col, 2, cv2.LINE_AA)
+                cv2.putText(canvas, f"({gx},{gy}) {sub_lbl}", (x1 + 8, y2 - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.36, t_col, 1, cv2.LINE_AA)
+
                 if (gx,gy) == self.start_cell:
-                    cv2.rectangle(canvas, (x1+4,y1+4),(x2-4,y2-4), C_START, 2)
-                    cv2.putText(canvas, "START",(x1+8,y1+20),
-                                cv2.FONT_HERSHEY_SIMPLEX,0.40,C_START,1,cv2.LINE_AA)
-                if (gx,gy) == self.exit_cell:
-                    cv2.rectangle(canvas, (x1+4,y1+4),(x2-4,y2-4), C_EXIT_C, 2)
-                    cv2.putText(canvas, "EXIT",(x1+8,y1+20) if (gx,gy)!=self.start_cell else (x1+8,y1+36),
-                                cv2.FONT_HERSHEY_SIMPLEX,0.40,C_EXIT_C,1,cv2.LINE_AA)
+                    cv2.rectangle(canvas, (x1+3,y1+3),(x2-3,y2-3), (0, 255, 120), 2)
+                    cv2.putText(canvas, "S",(x1+8,y1+20),
+                                cv2.FONT_HERSHEY_SIMPLEX,0.50,(0, 255, 120),2,cv2.LINE_AA)
+                if (gx,gy) == self.goal_cell:
+                    cv2.rectangle(canvas, (x1+3,y1+3),(x2-3,y2-3), (0, 230, 255), 2)
+                    pos = (x1+8,y1+20) if (gx,gy)!=self.start_cell else (x1+8,y1+34)
+                    cv2.putText(canvas, "G", pos,
+                                cv2.FONT_HERSHEY_SIMPLEX,0.50,(0, 230, 255),2,cv2.LINE_AA)
 
-        # Wall edges
-        for gy in range(4):
-            for gx in range(4):
-                x1, y1, x2, y2 = self._crect(gx, gy)
-                oN=(gy==3); oS=(gy==0); oE=(gx==3); oW=(gx==0)
-                self._draw_edge(canvas,(x1,y1),(x2,y1),maze_walls.get_wall_prob(gx,gy,"NORTH"),outer=oN)
-                self._draw_edge(canvas,(x1,y2),(x2,y2),maze_walls.get_wall_prob(gx,gy,"SOUTH"),outer=oS)
-                self._draw_edge(canvas,(x2,y1),(x2,y2),maze_walls.get_wall_prob(gx,gy,"EAST"), outer=oE)
-                self._draw_edge(canvas,(x1,y1),(x1,y2),maze_walls.get_wall_prob(gx,gy,"WEST"), outer=oW)
+        # Wall edges from ogm.get_edge() (Golden Yellow #FDCB6E)
+        if ogm is not None:
+            for gy in range(4):
+                for gx in range(4):
+                    x1, y1, x2, y2 = self._crect(gx, gy)
+                    # North: edge between (gx,gy) and (gx,gy+1)
+                    if ogm.get_edge((gx, gy), (gx, gy+1)) == -1:
+                        cv2.line(canvas, (x1, y1), (x2, y1), C_GOLDEN_WALL, 6, cv2.LINE_AA)
+                    # South: edge between (gx,gy) and (gx,gy-1)
+                    if ogm.get_edge((gx, gy), (gx, gy-1)) == -1:
+                        cv2.line(canvas, (x1, y2), (x2, y2), C_GOLDEN_WALL, 6, cv2.LINE_AA)
+                    # East: edge between (gx,gy) and (gx+1,gy)
+                    if ogm.get_edge((gx, gy), (gx+1, gy)) == -1:
+                        cv2.line(canvas, (x2, y1), (x2, y2), C_GOLDEN_WALL, 6, cv2.LINE_AA)
+                    # West: edge between (gx,gy) and (gx-1,gy)
+                    if ogm.get_edge((gx, gy), (gx-1, gy)) == -1:
+                        cv2.line(canvas, (x1, y1), (x1, y2), C_GOLDEN_WALL, 6, cv2.LINE_AA)
 
-        bx1=self.gox; by1=self.goy-4*self.cpx; bx2=bx1+4*self.cpx; by2=self.goy
-        cv2.rectangle(canvas,(bx1,by1),(bx2,by2),C_BORDER,4)
+        # Outer perimeter border (Golden Yellow)
+        bx1 = self.gox; by1 = self.goy - 4 * self.cpx; bx2 = bx1 + 4 * self.cpx; by2 = self.goy
+        cv2.rectangle(canvas, (bx1, by1), (bx2, by2), C_GOLDEN_WALL, 6)
 
         for gx in range(4):
             tx=self.gox+int((gx+0.35)*self.cpx)
-            cv2.putText(canvas,"X=%d"%gx,(tx,self.goy+22),cv2.FONT_HERSHEY_SIMPLEX,0.42,(155,150,145),1,cv2.LINE_AA)
+            cv2.putText(canvas,"X=%d"%gx,(tx,self.goy+22),cv2.FONT_HERSHEY_SIMPLEX,0.42,(180,175,170),1,cv2.LINE_AA)
         for gy in range(4):
             ty=self.goy-int((gy+0.55)*self.cpx)
-            cv2.putText(canvas,"Y=%d"%gy,(self.gox-50,ty),cv2.FONT_HERSHEY_SIMPLEX,0.42,(155,150,145),1,cv2.LINE_AA)
+            cv2.putText(canvas,"Y=%d"%gy,(self.gox-50,ty),cv2.FONT_HERSHEY_SIMPLEX,0.42,(180,175,170),1,cv2.LINE_AA)
 
         # Legend
         lx,ly=self.gox,self.goy+42
-        items=[(C_BORDER,"Arena"),(C_WALL_CONF,"Wall(P>=0.60)"),(C_WALL_LIKE,"Likely(P>=0.50)"),
-               (C_OPEN,"Clear(P<=0.40)"),(C_UNKNOWN,"Unknown")]
-        cv2.putText(canvas,"LEGEND:",(lx,ly),cv2.FONT_HERSHEY_SIMPLEX,0.40,(175,170,165),1,cv2.LINE_AA)
+        items=[(C_GOLDEN_WALL,"Wall (#FDCB6E)"), ((49, 48, 214),"OCC (#D63031)"),
+               ((148, 184, 0),"FREE (#00B894)"), ((114, 110, 99),"UNK (#636E72)")]
+        cv2.putText(canvas,"LEGEND:",(lx,ly),cv2.FONT_HERSHEY_SIMPLEX,0.40,(200,200,200),1,cv2.LINE_AA)
         for i,(col,lbl) in enumerate(items):
-            lxi=lx+i*95
-            cv2.line(canvas,(lxi+50,ly+2),(lxi+70,ly+2),col,4,cv2.LINE_AA)
-            cv2.putText(canvas,lbl,(lxi+72,ly+6),cv2.FONT_HERSHEY_SIMPLEX,0.32,(160,155,150),1,cv2.LINE_AA)
+            lxi=lx+i*115
+            cv2.line(canvas,(lxi+65,ly+2),(lxi+85,ly+2),col,5,cv2.LINE_AA)
+            cv2.putText(canvas,lbl,(lxi+88,ly+6),cv2.FONT_HERSHEY_SIMPLEX,0.32,(180,180,180),1,cv2.LINE_AA)
 
-        # Trajectory & robot
+        # Trajectory
         if len(path_history) > 1:
             for i in range(len(path_history)-1):
                 p1=self._cctr(path_history[i][0],path_history[i][1])
                 p2=self._cctr(path_history[i+1][0],path_history[i+1][1])
-                cv2.line(canvas,p1,p2,C_TRAJ,2,cv2.LINE_AA)
-                cv2.circle(canvas,p1,4,(0,220,255),-1)
-        rx,ry=self._cctr(robot_x,robot_y)
-        cv2.circle(canvas,(rx,ry),20,C_ROBOT,-1,cv2.LINE_AA)
-        cv2.circle(canvas,(rx,ry),20,(255,255,255),2,cv2.LINE_AA)
-        rad=math.radians(heading_deg)
-        ax=int(rx+24*math.sin(rad)); ay=int(ry-24*math.cos(rad))
-        cv2.arrowedLine(canvas,(rx,ry),(ax,ay),C_ARROW,3,cv2.LINE_AA,tipLength=0.35)
+                cv2.line(canvas,p1,p2,(0, 200, 255),3,cv2.LINE_AA)
+                cv2.circle(canvas,p1,5,(0, 220, 255),-1)
+
+        # Robot Triangle (from occupancy_grid_mapping.py)
+        rx, ry = self._cctr(robot_x, robot_y)
+        rs = 22
+        norm_h = int(round(heading_deg / 90.0) * 90) % 360
+        if norm_h == 0:
+            pts = np.array([[rx, ry - rs], [rx - rs, ry + rs], [rx + rs, ry + rs]], np.int32)
+        elif norm_h == 90:
+            pts = np.array([[rx + rs, ry], [rx - rs, ry - rs], [rx - rs, ry + rs]], np.int32)
+        elif norm_h == 180:
+            pts = np.array([[rx, ry + rs], [rx - rs, ry - rs], [rx + rs, ry - rs]], np.int32)
+        else:
+            pts = np.array([[rx - rs, ry], [rx + rs, ry - rs], [rx + rs, ry + rs]], np.int32)
+
+        C_ROBOT_PINK = (147, 67, 232)  # #E84393 in BGR
+        cv2.fillPoly(canvas, [pts], C_ROBOT_PINK, cv2.LINE_AA)
+        cv2.polylines(canvas, [pts], True, (255, 255, 255), 2, cv2.LINE_AA)
 
         # Right panel
         px=565; pw=self.W-px-10
@@ -447,7 +449,7 @@ class InteractiveDashboard:
         self._title(canvas,px,78,"CONFIG & TELEMETRY")
         cv2.putText(canvas,"Step #%d  Pos:(%d,%d)  Hdg:%ddeg"%(step_count,robot_x,robot_y,heading_deg),
                     (px+14,110),cv2.FONT_HERSHEY_SIMPLEX,0.46,(220,220,220),1,cv2.LINE_AA)
-        cv2.putText(canvas,"Exit:(%d,%d) <- click map to change"%self.exit_cell,
+        cv2.putText(canvas,"Goal (G):(%d,%d) <- click map to change"%self.goal_cell,
                     (px+14,132),cv2.FONT_HERSHEY_SIMPLEX,0.44,C_ACCENT,1,cv2.LINE_AA)
         self._hline(canvas,px,pw,148)
 
@@ -465,53 +467,58 @@ class InteractiveDashboard:
         self._pbar(canvas,px+14,242,pw-28,8,self.turn_speed/120.0,(80,180,220))
         self._hline(canvas,px,pw,258)
 
-        self._title(canvas,px,278,"SENSOR THRESHOLD CONFIG")
-        cv2.putText(canvas,"Wall Detect Threshold:",(px+14,308),cv2.FONT_HERSHEY_SIMPLEX,0.46,(220,220,220),1,cv2.LINE_AA)
-        cv2.putText(canvas,"%.0f cm"%self.wall_detect_cm,(px+216,308),cv2.FONT_HERSHEY_SIMPLEX,0.50,(255,200,80),2,cv2.LINE_AA)
-        self._btn(canvas,px+262,292,36,24," - ","WDET_DOWN",C_BTN_GRAY)
-        self._btn(canvas,px+304,292,36,24," + ","WDET_UP",  C_BTN_GRAY)
+        self._title(canvas,px,278,"SENSOR THRESHOLD")
+        cv2.putText(canvas,"Wall Detect:",(px+14,308),cv2.FONT_HERSHEY_SIMPLEX,0.46,(220,220,220),1,cv2.LINE_AA)
+        cv2.putText(canvas,"%.0f cm"%self.wall_detect_cm,(px+130,308),cv2.FONT_HERSHEY_SIMPLEX,0.50,(255,200,80),2,cv2.LINE_AA)
+        self._btn(canvas,px+190,292,36,24," - ","WDET_DOWN",C_BTN_GRAY)
+        self._btn(canvas,px+232,292,36,24," + ","WDET_UP",  C_BTN_GRAY)
         self._pbar(canvas,px+14,316,pw-28,8,self.wall_detect_cm/100.0,(220,180,40))
-        cv2.putText(canvas,"IO_WALL_VALUE=%d (wall when IO==%d)"%(self.io_wall_value,self.io_wall_value),
+        cv2.putText(canvas,"IO_WALL=%d"%self.io_wall_value,
                     (px+14,344),cv2.FONT_HERSHEY_SIMPLEX,0.43,(220,220,220),1,cv2.LINE_AA)
-        self._btn(canvas,px+14,354,116,24,"TOGGLE 0/1","IO_TOGGLE",C_BTN_WARN)
-        p_lbl = "PASSES: 1 (1-ROUND)" if self.scan_passes == 1 else "PASSES: 2 (DBL-CHK)"
-        self._btn(canvas,px+138,354,166,24,p_lbl,"TOGGLE_PASSES",C_BTN_BLUE)
-        self._hline(canvas,px,pw,388)
+        self._btn(canvas,px+120,328,100,24,"TOGGLE 0/1","IO_TOGGLE",C_BTN_WARN)
+        self._hline(canvas,px,pw,368)
 
-        self._title(canvas,px,408,"LIVE SENSOR READINGS")
+        self._title(canvas,px,388,"LIVE SENSOR READINGS")
         f_cm=sensor_data.get("front_dist_cm",999.0) if sensor_data else 999.0
         l_io=sensor_data.get("left_io",0)            if sensor_data else 0
         r_io=sensor_data.get("right_io",0)           if sensor_data else 0
         fw=(f_cm<config.WALL_DETECT_CM)
         fc=C_WALL_CONF if fw else C_OPEN
         cv2.putText(canvas,"Front ToF: %.1fcm [%s]"%(f_cm,"WALL" if fw else "CLEAR"),
-                    (px+14,434),cv2.FONT_HERSHEY_SIMPLEX,0.47,fc,2,cv2.LINE_AA)
-        self._pbar(canvas,px+14,444,pw-28,10,min(f_cm/150.0,1.0),fc,bg=(55,45,40))
+                    (px+14,414),cv2.FONT_HERSHEY_SIMPLEX,0.47,fc,2,cv2.LINE_AA)
+        self._pbar(canvas,px+14,424,pw-28,10,min(f_cm/150.0,1.0),fc,bg=(55,45,40))
         lw=(l_io==self.io_wall_value); lc=C_WALL_CONF if lw else C_OPEN
-        cv2.circle(canvas,(px+24,476),8,lc,-1)
-        cv2.putText(canvas,"Left  IR: IO=%d [%s]"%(l_io,"WALL" if lw else "CLEAR"),
-                    (px+40,481),cv2.FONT_HERSHEY_SIMPLEX,0.46,(220,220,220),1,cv2.LINE_AA)
+        cv2.circle(canvas,(px+24,456),8,lc,-1)
+        cv2.putText(canvas,"Left  IR: IO=%d [%s] (steer)"%(l_io,"WALL" if lw else "CLEAR"),
+                    (px+40,461),cv2.FONT_HERSHEY_SIMPLEX,0.44,(220,220,220),1,cv2.LINE_AA)
         rw=(r_io==self.io_wall_value); rc=C_WALL_CONF if rw else C_OPEN
-        cv2.circle(canvas,(px+24,502),8,rc,-1)
-        cv2.putText(canvas,"Right IR: IO=%d [%s]"%(r_io,"WALL" if rw else "CLEAR"),
-                    (px+40,507),cv2.FONT_HERSHEY_SIMPLEX,0.46,(220,220,220),1,cv2.LINE_AA)
-        self._hline(canvas,px,pw,522)
+        cv2.circle(canvas,(px+24,482),8,rc,-1)
+        cv2.putText(canvas,"Right IR: IO=%d [%s] (steer)"%(r_io,"WALL" if rw else "CLEAR"),
+                    (px+40,487),cv2.FONT_HERSHEY_SIMPLEX,0.44,(220,220,220),1,cv2.LINE_AA)
+        self._hline(canvas,px,pw,502)
 
-        self._title(canvas,px,540,"AI EXPLORER STATUS")
+        self._title(canvas,px,520,"A* EXPLORER STATUS")
         parts=explorer_status.split("->")
         for i,part in enumerate(parts):
             cv2.putText(canvas,"%s%s"%("Action: " if i==0 else "  -> ",part.strip()),
-                        (px+14,562+i*22),cv2.FONT_HERSHEY_SIMPLEX,0.43,(255,255,120),1,cv2.LINE_AA)
-        self._hline(canvas,px,pw,606)
+                        (px+14,542+i*22),cv2.FONT_HERSHEY_SIMPLEX,0.43,(255,255,120),1,cv2.LINE_AA)
 
-        self._title(canvas,px,622,"ACTION BUTTONS  [W A D S E P Q]")
-        y1b=630; y2b=y1b+34
-        self._btn(canvas,px+14, y1b,162,30,"EXPLORE MAZE (E)","BTN_EXPLORE", C_BTN_GREEN)
-        self._btn(canvas,px+184,y1b,156,30,"STEP FWD  (W)",   "BTN_STEP_FWD",C_BTN_BLUE)
+        # Edge stats
+        total_edges = sum(1 for v in ogm.edges.values() if v != 0) if ogm else 0
+        wall_count = sum(1 for v in ogm.edges.values() if v == -1) if ogm else 0
+        open_count = sum(1 for v in ogm.edges.values() if v == 1) if ogm else 0
+        visited_count = len(ogm.visited) if ogm else 0
+        cv2.putText(canvas, f"Visited: {visited_count}/16 | Walls: {wall_count} | Open: {open_count}",
+                    (px+14, 580), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180,220,180), 1, cv2.LINE_AA)
+        self._hline(canvas,px,pw,596)
+
+        self._title(canvas,px,612,"ACTION BUTTONS  [W A D E P Q]")
+        y1b=620; y2b=y1b+34
+        self._btn(canvas,px+14, y1b,162,30,"EXPLORE (E)","BTN_EXPLORE", C_BTN_GREEN)
+        self._btn(canvas,px+184,y1b,156,30,"STEP FWD (W)","BTN_STEP_FWD",C_BTN_BLUE)
         self._btn(canvas,px+14, y2b,100,28,"TURN L (A)","BTN_TURN_L",C_BTN_GRAY)
-        self._btn(canvas,px+120,y2b,102,28,"SCAN 360(S)","BTN_SCAN",  C_BTN_GRAY)
-        self._btn(canvas,px+228,y2b, 98,28,"TURN R (D)","BTN_TURN_R",C_BTN_GRAY)
-        self._btn(canvas,px+332,y2b, 88,28,"SAVE  (P)", "BTN_SAVE",  C_BTN_GRAY)
+        self._btn(canvas,px+120,y2b,102,28,"TURN R (D)","BTN_TURN_R",C_BTN_GRAY)
+        self._btn(canvas,px+228,y2b, 98,28,"SAVE  (P)","BTN_SAVE",  C_BTN_GRAY)
 
         cv2.imshow(self.window_name, canvas)
         cv2.waitKey(1)

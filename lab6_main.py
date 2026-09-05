@@ -3,13 +3,17 @@
 lab6_main.py — Main Experiment Runner for Lab 6 (Occupancy Grid Mapping)
 RoboMaster EP 4x4 Grid OGM using Bayesian Log-Odds Updates.
 
-Usage:
-  - Mock/Simulation mode:
-      python lab6_main.py --mock
-  - Real RoboMaster EP mode (Wi-Fi AP):
-      cd C:\robotproject\robot_sahapong\lab6
-python lab6_main.py --real --explore
+Navigation logic matches occupancy_grid_mapping.py exactly:
+  1. mark_visited(x, y) -> A* plan -> pick next_node
+  2. Turn to face next_node
+  3. Front ToF check:
+     - < WALL_DETECT_CM: set_edge = -1 (wall), update_cell OCC, replan
+     - >= WALL_DETECT_CM: set_edge = 1 (open), move forward 60cm with Yaw PID
+  4. After exploring all reachable cells -> navigate to Goal (G)
 
+Usage:
+  - Simulation:   python lab6_main.py --mock
+  - Real robot:   python lab6_main.py --real
 """
 
 import sys
@@ -33,854 +37,429 @@ if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
 import config
-from ogm import OccupancyGridMap
+from ogm import OccupancyGridMap, DIRS
 from sensors import SensorManager
-from explorer import AutonomousExplorer
+from explorer import a_star_planner, heading_deg_to_idx, heading_idx_to_deg
 from dashboard import InteractiveDashboard
-from maze_walls import MazeWalls
 
 
 class Lab6Experiment:
     """
-    ตัวควบคุมการทดลอง Lab 6:
-      - นำทางหุ่นยนต์บน Grid 4x4 (ทีละก้าว 60 cm)
-      - อ่านค่าเซนเซอร์ Front ToF (ล็อก Gimbal ตรง), Left/Right Digital IR I/O
-      - อัปเดตตารางกำแพงรอบด้าน (MazeWalls: North, East, South, West) และ OGM
-      - ระบบสำรวจเขาวงกตหาทางออกอัตโนมัติ (Autonomous Maze Exploration)
-      - หน้าจอ Interactive Dashboard กำหนดทางออกและความเร็วได้สดๆ (OpenCV)
+    Main experiment controller for Lab 6.
+    Navigation logic matches occupancy_grid_mapping.py exactly.
     """
 
     def __init__(self, use_mock=True):
         self.use_mock = use_mock
         self.ep_robot = None
         self.ogm = OccupancyGridMap()
-        self.maze_walls = MazeWalls()
         self.dashboard = InteractiveDashboard()
-        self.explorer = AutonomousExplorer(exit_cell=self.dashboard.exit_cell)
 
-        # สถานะตำแหน่งของหุ่นยนต์ (เริ่มต้นที่จุด (0, 0) หันหน้าไปทางทิศเหนือ Heading = 0°)
-        # 0° = North (+Y), 90° = East (+X), 180° = South (-Y), 270° = West (-X)
+        # Robot state
         self.robot_x = 0
         self.robot_y = 0
         self.heading_deg = 0
+        self.initial_yaw_offset = 0.0
 
-        # บันทึกเส้นทางที่เดิน (Trajectory)
+        # Trajectory
         self.path_history = [(self.robot_x, self.robot_y)]
         self.step_counter = 0
-        self.scanned_cells = set()
 
-        # เตรียมเซนเซอร์
+        # Sensors
         self.sensor_mgr = None
 
     def apply_setup_choices(self):
-        """Apply start_cell/exit_cell chosen in Dashboard Setup phase."""
+        """Apply start_cell/goal_cell chosen in Dashboard Setup phase."""
         sx, sy = self.dashboard.start_cell
         self.robot_x = sx
         self.robot_y = sy
         self.path_history = [(sx, sy)]
-        self.scanned_cells.clear()
-        self.explorer.set_exit_cell(self.dashboard.exit_cell)
-        config.EXIT_CELL = self.dashboard.exit_cell
-        print("[Setup] Start=(%d,%d)  Exit=(%d,%d)" % (sx, sy,
-              self.dashboard.exit_cell[0], self.dashboard.exit_cell[1]))
+        config.EXIT_CELL = self.dashboard.goal_cell
+        print("[Setup] Start=(%d,%d)  Goal=(%d,%d)" % (sx, sy,
+              self.dashboard.goal_cell[0], self.dashboard.goal_cell[1]))
 
     def initialize_system(self):
-        """เชื่อมต่อหุ่นยนต์และตั้งค่าฮาร์ดแวร์"""
+        """Connect to robot and setup hardware."""
         if not self.use_mock:
-            print(f"[Main] [CONNECT] กำลังเชื่อมต่อ RoboMaster EP ผ่าน Wi-Fi ({config.CONN_TYPE.upper()})...")
+            print(f"[Main] [CONNECT] Connecting to RoboMaster EP via Wi-Fi ({config.CONN_TYPE.upper()})...")
             try:
                 from robomaster import robot
                 self.ep_robot = robot.Robot()
                 self.ep_robot.initialize(conn_type=config.CONN_TYPE)
-                print("[Main] [OK] เชื่อมต่อหุ่นยนต์สำเร็จ!")
+                print("[Main] [OK] Robot connected!")
             except Exception as e:
-                print(f"[Main] [ERROR] ไม่สามารถเชื่อมต่อกับหุ่นยนต์ได้: {e}")
-                print("[Main] [ERROR] ตรวจสอบ:")
-                print("         1. PC เชื่อม Wi-Fi ชื่อ RoboMaster_XXXX แล้วหรือยัง?")
-                print("         2. หุ่นยนต์เปิดอยู่และไฟ LED กระพริบหรือไม่?")
-                print("         3. ถ้าต้องการ Simulation ให้ใช้ --mock แทน --real")
-                print("[Main] [EXIT] ยกเลิกการทดลอง (ไม่มี fallback ไป simulation โดยอัตโนมัติ)")
+                print(f"[Main] [ERROR] Cannot connect: {e}")
+                print("[Main] Use --mock for simulation mode")
                 return False
 
         self.sensor_mgr = SensorManager(ep_robot=self.ep_robot, mock=self.use_mock)
-        return self.sensor_mgr.setup_hardware()
+        ok = self.sensor_mgr.setup_hardware()
+        if ok and not self.use_mock:
+            time.sleep(0.5)
+            self.initial_yaw_offset = self.sensor_mgr.get_current_yaw()
+            print(f"[Main] [OK] Initial IMU Yaw Offset = {self.initial_yaw_offset:.2f} deg")
+        return ok
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Movement Helpers (matching occupancy_grid_mapping.py)
+    # ══════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _normalize_angle(angle):
+        while angle > 180.0:
+            angle -= 360.0
+        while angle <= -180.0:
+            angle += 360.0
+        return angle
 
     @staticmethod
     def _deg_to_cardinal(deg):
-        """แปลงมุมองศาเป็นทิศหลัก (NORTH, EAST, SOUTH, WEST)"""
         d = int(round(deg / 90.0) * 90) % 360
-        if d == 0: return "NORTH"
-        elif d == 90: return "EAST"
-        elif d == 180: return "SOUTH"
-        elif d == 270: return "WEST"
-        return "NORTH"
+        return {0: "NORTH", 90: "EAST", 180: "SOUTH", 270: "WEST"}.get(d, "NORTH")
 
-    def perform_scan_and_update(self, status_reason="SCANNING", use_side_ir=True):
-        """
-        อ่านค่าเซนเซอร์ทั้งหมดและอัปเดตค่าความน่าจะเป็นของกำแพงรอบด้าน (MazeWalls)
-        และ OGM พร้อมเรนเดอร์หน้าจอ Interactive Dashboard
-        - use_side_ir: หากเป็น False (เช่น ขณะหมุน 360 สแกน) จะใช้เฉพาะ Front ToF ในการระบุสิ่งกีดขวาง
-          เพื่อป้องกันไม่ให้เซนเซอร์ IR ด้านข้างที่อาจมี noise มารบกวนหรือทับค่าพื้นที่ว่าง
-        """
-        self.step_counter += 1
-        print(f"\n[Step #{self.step_counter}] กำลังสแกนเซนเซอร์ ณ ตำแหน่ง ({self.robot_x}, {self.robot_y}) Heading: {self.heading_deg}°...")
+    def _heading_to_target_yaw(self, heading_deg):
+        norm_h = int(round(heading_deg / 90.0) * 90) % 360
+        return {0: 0.0, 90: 90.0, 180: 180.0, 270: -90.0}.get(norm_h, 0.0)
 
-        # 1. อ่านค่าเซนเซอร์ 3 ด้าน
-        data = self.sensor_mgr.read_all_sensors(self.robot_x, self.robot_y, self.heading_deg)
-        front_cm = data["front_dist_cm"]
-        front_wall = data["front_is_wall"]
-        left_io = data["left_io"]
-        left_wall = data["left_is_wall"]
-        right_io = data["right_io"]
-        right_wall = data["right_is_wall"]
+    def turn_to_heading(self, target_heading_deg):
+        """Turn robot to face a specific heading (0/90/180/270).
+        Matching RobotController.turn_to() from occupancy_grid_mapping.py."""
+        target_heading_deg = int(round(target_heading_deg / 90.0) * 90) % 360
+        if self.heading_deg == target_heading_deg:
+            return
 
-        print(f"       -> ด้านหน้า (ToF บน Gimbal): {front_cm:.1f} cm [{'WALL' if front_wall else 'CLEAR'}]")
-        print(f"       -> ด้านซ้าย  (Digital IR IO): Value={left_io} [{'WALL' if left_wall else 'CLEAR'}]")
-        print(f"       -> ด้านขวา   (Digital IR IO): Value={right_io} [{'WALL' if right_wall else 'CLEAR'}]")
+        diff = (target_heading_deg - self.heading_deg) % 360
+        current_turn_speed = self.dashboard.turn_speed
 
-        # 2. คำนวณทิศทางจริงตามเข็มทิศ
-        front_dir = self._deg_to_cardinal(self.heading_deg)
-        left_dir = self._deg_to_cardinal(self.heading_deg - 90)
-        right_dir = self._deg_to_cardinal(self.heading_deg + 90)
+        if not self.use_mock and self.ep_robot:
+            try:
+                self.ep_robot.chassis.drive_speed(x=0, y=0, z=0)
+                time.sleep(0.1)
+                if diff == 90:
+                    self.ep_robot.chassis.move(x=0, y=0, z=-90, z_speed=current_turn_speed).wait_for_completed()
+                elif diff == 180:
+                    self.ep_robot.chassis.move(x=0, y=0, z=180, z_speed=current_turn_speed).wait_for_completed()
+                elif diff == 270:
+                    self.ep_robot.chassis.move(x=0, y=0, z=90, z_speed=current_turn_speed).wait_for_completed()
+                time.sleep(0.3)
+            except Exception as e:
+                print(f"[Move] [ERROR] Turn error: {e}")
+        else:
+            time.sleep(0.2)
 
-        # 2.1 อัปเดตขอบกำแพงรอบด้าน (MazeWalls)
-        # ToF ด้านหน้าเป็นตัวหลักในการสร้างแมพ
-        self.maze_walls.update_wall_sensor(self.robot_x, self.robot_y, front_dir, is_wall=front_wall)
-        
-        # ปิดการใช้ IR ด้านข้างสร้างกำแพงถาวร ป้องกัน false positive เวลารถเอียง
-        # if use_side_ir:
-        #     self.maze_walls.update_wall_sensor(self.robot_x, self.robot_y, left_dir, is_wall=left_wall)
-        #     self.maze_walls.update_wall_sensor(self.robot_x, self.robot_y, right_dir, is_wall=right_wall)
+        self.heading_deg = target_heading_deg
+        print(f"[Move] Heading -> {self.heading_deg} deg ({self._deg_to_cardinal(self.heading_deg)})")
 
-        # 2.2 อัปเดต Bayesian Log-Odds OGM (เซลล์)
-        self.ogm.update_direction_sensor(self.robot_x, self.robot_y, self.heading_deg, 0, front_cm)
-        if use_side_ir:
-            self.ogm.update_direction_binary(self.robot_x, self.robot_y, self.heading_deg, -90, left_wall)
-            self.ogm.update_direction_binary(self.robot_x, self.robot_y, self.heading_deg, 90, right_wall)
+    def move_forward_pid(self):
+        """Move forward 60cm with IMU Yaw PID + IR lateral steering.
+        Matching RobotController.move_forward_pid() from occupancy_grid_mapping.py."""
+        heading_idx = heading_deg_to_idx(self.heading_deg)
+        dx, dy = DIRS[heading_idx]
+        next_x = self.robot_x + dx
+        next_y = self.robot_y + dy
 
-        # บันทึกประวัติ
-        log_entry = (f"Step {self.step_counter}: Pos=({self.robot_x},{self.robot_y}) "
-                     f"Heading={self.heading_deg} deg | Front={front_cm:.1f}cm ({'WALL' if front_wall else 'CLEAR'}), "
-                     f"Left_IO={left_io} ({'WALL' if left_wall else 'CLEAR'}), "
-                     f"Right_IO={right_io} ({'WALL' if right_wall else 'CLEAR'})")
-        self.ogm.history.append(log_entry)
+        if not self.ogm.is_valid_cell(next_x, next_y):
+            print(f"[Move] [WARN] Out of bounds: ({next_x}, {next_y})")
+            return False
 
-        # 3. แสดงผลตาราง Real-time ASCII บน Terminal
-        self.ogm.print_ascii_map(self.robot_x, self.robot_y, self.heading_deg)
+        fwd_speed = self.dashboard.move_speed
+        target_dist = config.STEP_DISTANCE_M
+        duration = target_dist / max(fwd_speed, 0.05)
 
-        # 4. ซิงค์เป้าหมายทางออกถ้าผู้ใช้คลิกเลือกบน Dashboard
-        if self.explorer.exit_cell != self.dashboard.exit_cell:
-            self.explorer.set_exit_cell(self.dashboard.exit_cell)
+        print(f"[Move] [FWD] Moving {target_dist*100:.0f}cm @ {fwd_speed:.2f}m/s -> ({next_x},{next_y})")
 
-        # 5. อัปเดตหน้าต่าง Interactive GUI Dashboard (OpenCV)
+        if not self.use_mock and self.ep_robot:
+            t_start = time.monotonic()
+            last_yaw_err = 0.0
+            target_yaw = self.initial_yaw_offset + self._heading_to_target_yaw(self.heading_deg)
+
+            try:
+                while time.monotonic() - t_start < duration:
+                    # Emergency stop if very close wall
+                    tof_now = self.sensor_mgr.read_front_tof()
+                    if tof_now is not None and 0 < tof_now < 15.0:
+                        print(f"  [Steer] EMERGENCY STOP (ToF={tof_now:.1f}cm)")
+                        break
+
+                    # Read IR for lateral steering (0 = Wall, 1 = Clear)
+                    l_val, l_wall = self.sensor_mgr.read_left_io()
+                    r_val, r_wall = self.sensor_mgr.read_right_io()
+
+                    # IMU Yaw PID
+                    current_yaw = self.sensor_mgr.get_current_yaw()
+                    yaw_error = self._normalize_angle(target_yaw - current_yaw)
+                    d_yaw = yaw_error - last_yaw_err
+                    z_speed = (config.KP_YAW * yaw_error) + (config.KD_YAW * d_yaw)
+                    last_yaw_err = yaw_error
+
+                    # Digital IR steering nudge (NOT for wall mapping!)
+                    vy = 0.0
+                    if l_wall and not r_wall:
+                        vy = -0.05  # Wall on left -> nudge right
+                    elif r_wall and not l_wall:
+                        vy = 0.05   # Wall on right -> nudge left
+
+                    vy = max(min(vy, config.MAX_CORRECTION_Y), -config.MAX_CORRECTION_Y)
+                    self.ep_robot.chassis.drive_speed(x=fwd_speed, y=vy, z=z_speed)
+                    time.sleep(0.02)
+            except Exception as e:
+                print(f"[Move] [ERROR] drive_speed error: {e}")
+            finally:
+                try:
+                    self.ep_robot.chassis.drive_speed(x=0, y=0, z=0)
+                    time.sleep(0.12)
+                except Exception:
+                    pass
+        else:
+            # Mock mode
+            time.sleep(duration * 0.3)
+
+        # Update position
+        self.robot_x = next_x
+        self.robot_y = next_y
+        self.path_history.append((self.robot_x, self.robot_y))
+        return True
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Dashboard / Scan
+    # ══════════════════════════════════════════════════════════════════════
+
+    def read_ir_quick(self):
+        """Quick IR read for display/steering info."""
+        if self.use_mock or not self.ep_robot:
+            data = self.sensor_mgr.read_all_sensors(self.robot_x, self.robot_y, self.heading_deg)
+            return data["left_io"], data["right_io"], data["left_is_wall"], data["right_is_wall"]
+        l_val, l_wall = self.sensor_mgr.read_left_io()
+        r_val, r_wall = self.sensor_mgr.read_right_io()
+        return l_val, r_val, l_wall, r_wall
+
+    def update_dashboard(self, mode_label="Exploring..."):
+        """Render dashboard with current state."""
+        ir_l, ir_r, _, _ = self.read_ir_quick()
+        tof_cm = self.sensor_mgr.sample_front_tof(num_samples=3, sample_interval=0.03) if self.sensor_mgr else 999.0
+
+        sensor_data = {
+            "front_dist_cm": tof_cm,
+            "front_is_wall": tof_cm < config.WALL_DETECT_CM,
+            "left_io": ir_l,
+            "left_is_wall": (ir_l == config.IO_WALL_VALUE),
+            "right_io": ir_r,
+            "right_is_wall": (ir_r == config.IO_WALL_VALUE),
+        }
+
         self.dashboard.render(
-            maze_walls=self.maze_walls,
             ogm=self.ogm,
             robot_x=self.robot_x,
             robot_y=self.robot_y,
             heading_deg=self.heading_deg,
             path_history=self.path_history,
-            sensor_data=data,
-            explorer_status=status_reason,
+            sensor_data=sensor_data,
+            explorer_status=mode_label,
             mode_str="MOCK SIMULATION" if self.use_mock else "REAL ROBOT",
             step_count=self.step_counter
         )
-        return data
 
-    # ================================================================
-    # IR WALL AVOIDANCE SYSTEM
-    # ================================================================
+    # ══════════════════════════════════════════════════════════════════════
+    #  A* Exploration Loop (matching occupancy_grid_mapping.py main loop)
+    # ══════════════════════════════════════════════════════════════════════
 
-    def read_ir_quick(self, num_samples=3):
+    def run_autonomous_exploration(self, max_steps=80):
         """
-        อ่านค่า IR ซ้าย/ขวาแบบ Real-time หลาย samples แล้ว Majority-Vote
-        เพื่อป้องกัน Noise จากมอเตอร์หรือสัญญาณรบกวนชั่วคราว
-        คืนค่า: (left_wall: bool, right_wall: bool, left_io: int, right_io: int)
+        Autonomous exploration loop matching occupancy_grid_mapping.py exactly:
+        1. mark_visited(x, y)
+        2. A* plan path to nearest unvisited cell
+        3. If no unvisited -> switch to "goal" mode toward Goal cell
+        4. Take next_node = path[1], turn to face it
+        5. ToF check: wall -> set_edge -1, replan; clear -> set_edge 1, move
         """
-        if self.use_mock or not self.ep_robot:
-            # Mock: อ่านจาก sensor_mgr ตามปกติ
-            data = self.sensor_mgr.read_all_sensors(self.robot_x, self.robot_y, self.heading_deg)
-            return data["left_is_wall"], data["right_is_wall"], data["left_io"], data["right_io"]
+        goal_cell = self.dashboard.goal_cell
+        is_going_to_goal = False
 
-        left_readings  = []
-        right_readings = []
-        for _ in range(num_samples):
-            l_val, l_wall = self.sensor_mgr.read_left_io()
-            r_val, r_wall = self.sensor_mgr.read_right_io()
-            left_readings.append((l_val, l_wall))
-            right_readings.append((r_val, r_wall))
-            time.sleep(0.025)  # 25ms ต่อ sample → รวม ~75ms
-
-        # Majority vote: เจอกำแพง >= 2 ใน 3 ครั้ง ถือว่าเจอกำแพง
-        left_wall_votes  = sum(1 for _, w in left_readings  if w)
-        right_wall_votes = sum(1 for _, w in right_readings if w)
-        left_wall  = left_wall_votes  >= (num_samples // 2 + 1)
-        right_wall = right_wall_votes >= (num_samples // 2 + 1)
-        left_io  = left_readings[-1][0]
-        right_io = right_readings[-1][0]
-        return left_wall, right_wall, left_io, right_io
-
-    def read_front_tof_quick(self):
-        """
-        อ่าน ToF ด้านหน้าแบบเร็ว (multi-sample median) สำหรับ avoidance check
-        คืนค่า: (dist_cm: float, is_wall: bool)
-        """
-        if self.use_mock or not self.ep_robot:
-            data = self.sensor_mgr.read_all_sensors(self.robot_x, self.robot_y, self.heading_deg)
-            return data["front_dist_cm"], data["front_is_wall"]
-        dist_cm = self.sensor_mgr.sample_front_tof(num_samples=4, sample_interval=0.03)
-        is_wall = dist_cm < config.WALL_DETECT_CM
-        return dist_cm, is_wall
-
-    def ir_safety_check_before_move(self):
-        """
-        ตรวจสอบความปลอดภัยก่อนเดินหน้า 1 ช่อง โดยใช้ IR Real-time:
-          1. ToF ด้านหน้า: ถ้าระยะ < WALL_DETECT_CM → ห้ามเดิน (BLOCKED)
-          2. IR ซ้าย/ขวา: บันทึกค่าไว้อัปเดต MazeWalls แต่ไม่บล็อกการเดิน
-             (เนื่องจาก IR ซ้าย/ขวา = กำแพงข้างๆ ช่องปัจจุบัน ไม่ใช่ทางเดินข้างหน้า)
-        คืนค่า: (safe_to_move: bool, front_cm: float, left_wall: bool, right_wall: bool)
-        """
-        print("  [IR-Check] กำลังตรวจสอบ IR ก่อนเดิน...")
-        # อ่าน ToF หน้า
-        front_cm, front_wall = self.read_front_tof_quick()
-        # อ่าน IR ซ้าย/ขวา
-        left_wall, right_wall, left_io, right_io = self.read_ir_quick()
-
-        left_dir  = self._deg_to_cardinal(self.heading_deg - 90)
-        right_dir = self._deg_to_cardinal(self.heading_deg + 90)
-
-        # อัปเดต MazeWalls จากข้อมูล IR ล่าสุด
-        # ปิดการอัปเดตแมพหลักด้วย IR เพื่อป้องกันกำแพงปลอมเวลารถวิ่งเอียง
-        # self.maze_walls.update_wall_sensor(
-        #     self.robot_x, self.robot_y, left_dir,  is_wall=left_wall,  weight=1.5)
-        # self.maze_walls.update_wall_sensor(
-        #     self.robot_x, self.robot_y, right_dir, is_wall=right_wall, weight=1.5)
-
-        lbl_l = f"IO={left_io} [{'WALL' if left_wall else 'CLEAR'}]"
-        lbl_r = f"IO={right_io} [{'WALL' if right_wall else 'CLEAR'}]"
-        lbl_f = f"{front_cm:.1f} cm [{'WALL!' if front_wall else 'CLEAR'}]"
-        print(f"  [IR-Check] Front ToF: {lbl_f}  | Left IR: {lbl_l}  | Right IR: {lbl_r}")
-
-        if front_wall:
-            print("  [IR-Check] *** กำแพงด้านหน้า! ยกเลิกการเดิน ***")
-            # อัปเดต MazeWalls ฝั่งหน้าด้วย weight สูง
-            front_dir = self._deg_to_cardinal(self.heading_deg)
-            self.maze_walls.update_wall_sensor(
-                self.robot_x, self.robot_y, front_dir, is_wall=True, weight=2.0)
-            return False, front_cm, left_wall, right_wall
-
-        return True, front_cm, left_wall, right_wall
-
-    def ir_wall_avoidance(self, reason="AVOIDANCE"):
-        """
-        ระบบหลีกเลี่ยงกำแพงฉุกเฉินด้วย IR:
-        ตรวจสอบ IR ซ้าย/ขวา และ ToF หน้า แล้วสั่งเลี้ยวหาทางว่าง
-        Logic Priority:
-          1. ถ้า Front CLEAR: ไม่ทำอะไร (ปลอดภัย)
-          2. ถ้า Front WALL + Left CLEAR:  หมุนซ้าย
-          3. ถ้า Front WALL + Right CLEAR: หมุนขวา
-          4. ถ้า Front+Left WALL, Right CLEAR: หมุนขวา
-          5. ถ้า Front+Right WALL, Left CLEAR: หมุนซ้าย
-          6. ถ้า Wall รอบด้าน: หมุน 180° (กลับหลัง)
-        คืนค่า: (action_taken: str)  เช่น "NONE", "TURN_LEFT", "TURN_RIGHT", "REVERSE"
-        """
-        print("\n" + "=" * 55)
-        print("  [AVOIDANCE] ตรวจสอบ IR เพื่อหลีกเลี่ยงกำแพง...")
-        print("=" * 55)
-
-        front_cm, front_wall = self.read_front_tof_quick()
-        left_wall, right_wall, left_io, right_io = self.read_ir_quick()
-
-        front_dir = self._deg_to_cardinal(self.heading_deg)
-        left_dir  = self._deg_to_cardinal(self.heading_deg - 90)
-        right_dir = self._deg_to_cardinal(self.heading_deg + 90)
-
-        print(f"  Front ToF : {front_cm:.1f} cm -> [{'WALL' if front_wall else 'CLEAR'}]")
-        print(f"  Left  IR  : IO={left_io}  -> [{'WALL' if left_wall else 'CLEAR'}]")
-        print(f"  Right IR  : IO={right_io} -> [{'WALL' if right_wall else 'CLEAR'}]")
-
-        # อัปเดต MazeWalls
-        self.maze_walls.update_wall_sensor(self.robot_x, self.robot_y, front_dir, is_wall=front_wall, weight=2.0)
-        self.maze_walls.update_wall_sensor(self.robot_x, self.robot_y, left_dir,  is_wall=left_wall,  weight=2.0)
-        self.maze_walls.update_wall_sensor(self.robot_x, self.robot_y, right_dir, is_wall=right_wall, weight=2.0)
-
-        # ทางหน้าโล่ง → ไม่ต้องหลีก
-        if not front_wall:
-            print("  [AVOIDANCE] ทางหน้าโล่ง — ไม่จำเป็นต้องหลีก")
-            return "NONE"
-
-        # ทางหน้าโดนบล็อก → หาทางเลี้ยว
-        # ตรวจสอบ Left / Right ว่าข้างไหนโล่ง
-        can_left  = not self.maze_walls.is_wall_blocked(self.robot_x, self.robot_y, left_dir)
-        can_right = not self.maze_walls.is_wall_blocked(self.robot_x, self.robot_y, right_dir)
-
-        # ถ้า IR บอกโล่งแม้ maze_walls ยังไม่รู้ ก็ใช้ IR โดยตรงเป็น override
-        if not left_wall:
-            can_left = True
-        if not right_wall:
-            can_right = True
-
-        print(f"  [AVOIDANCE] Front=WALL | Left={'CLEAR' if can_left else 'WALL'} | Right={'CLEAR' if can_right else 'WALL'}")
-
-        if can_right and not can_left:
-            # ขวาโล่งอย่างเดียว → เลี้ยวขวา
-            print("  [AVOIDANCE] ➜ เลี้ยวขวา (Right CLEAR)")
-            self.turn_right(reason=f"{reason}_AVOID_RIGHT", use_side_ir=True)
-            return "TURN_RIGHT"
-
-        elif can_left and not can_right:
-            # ซ้ายโล่งอย่างเดียว → เลี้ยวซ้าย
-            print("  [AVOIDANCE] ➜ เลี้ยวซ้าย (Left CLEAR)")
-            self.turn_left(reason=f"{reason}_AVOID_LEFT", use_side_ir=True)
-            return "TURN_LEFT"
-
-        elif can_left and can_right:
-            # ทั้งสองข้างโล่ง → เลือกข้างที่ IR บอกว่าโล่งกว่า
-            # ถ้าทั้งคู่โล่งเท่ากัน → เลี้ยวขวาก่อน (กฎมือขวา)
-            if not right_wall:
-                print("  [AVOIDANCE] ➜ เลี้ยวขวา (ทั้งสองข้างโล่ง → ใช้กฎมือขวา)")
-                self.turn_right(reason=f"{reason}_AVOID_RIGHT_PREF", use_side_ir=True)
-                return "TURN_RIGHT"
-            else:
-                print("  [AVOIDANCE] ➜ เลี้ยวซ้าย (IR ซ้ายโล่งกว่า)")
-                self.turn_left(reason=f"{reason}_AVOID_LEFT_PREF", use_side_ir=True)
-                return "TURN_LEFT"
-
-        else:
-            # ติดกำแพงทุกด้าน → ระงับการเดินและรอให้ Explorer ถอยหลัง
-            print("  [AVOIDANCE] *** ติดกำแพงทุกด้าน! ยกเลิกการเคลื่อนที่เพื่อเตรียมถอยหลัง ***")
-            return "REVERSE"
-
-    def move_forward_one_cell(self, reason="MOVING", use_ir_avoidance=True):
-        """
-        เดินหน้า 1 ช่อง (60 cm) พร้อม Real-time IR Steering:
-        - ใช้ chassis.drive_speed() เพื่อให้ IR ซ้าย/ขวาปรับทิศได้ขณะเดินหน้า
-        - ตรวจสอบ ToF ทุก 200ms ขณะเดิน — หยุดฉุกเฉินถ้าเจอกำแพงหน้า
-        - อัปเดต dashboard ขณะเดินให้แมพตอบสนองทันที
-        """
-        # คำนวณตำแหน่งถัดไปตาม Heading
-        dx, dy = 0, 0
-        norm_h = int(round(self.heading_deg / 90.0) * 90) % 360
-        if norm_h == 0:
-            dy = 1   # North
-        elif norm_h == 90:
-            dx = 1   # East
-        elif norm_h == 180:
-            dy = -1  # South
-        elif norm_h == 270:
-            dx = -1  # West
-
-        next_x = self.robot_x + dx
-        next_y = self.robot_y + dy
-
-        # ── ตรวจสอบขอบเขตสนาม ─────────────────────────────────────────────
-        if not self.ogm.is_valid_cell(next_x, next_y):
-            print(f"[Move] [WARN] ไม่สามารถเดินหน้าได้: ชนขอบเขตสนาม 4x4! (เป้าหมาย: {next_x}, {next_y})")
-            return False
-
-        # ── ตรวจสอบกำแพงจาก MazeWalls ────────────────────────────────────────
-        card_dir = self._deg_to_cardinal(self.heading_deg)
-        if self.maze_walls.is_wall_blocked(self.robot_x, self.robot_y, card_dir):
-            print(f"[Move] [WARN] ไม่สามารถเดินหน้าได้: MazeWalls บอกกำแพงกั้นในทิศ {card_dir}!")
-            return False
-
-        # ── [IR AVOIDANCE] ตรวจสอบ IR Real-time ก่อนเดิน ──────────────────────
-        if use_ir_avoidance:
-            safe, front_cm, left_wall, right_wall = self.ir_safety_check_before_move()
-            if not safe:
-                print(f"[Move] [AVOIDANCE] IR ตรวจพบกำแพงด้านหน้า (ToF={front_cm:.1f} cm) → ยกเลิกการเดินไปที่ ({next_x}, {next_y})")
-                # เรียกใช้ระบบหลีกเลี่ยงกำแพงฉุกเฉิน (จะเช็คซ้าย/ขวาและเลี้ยวหนีทันที)
-                self.ir_wall_avoidance(reason="AVOID_BEFORE_MOVE")
-                return False
-
-        # ── สั่งเดินหน้าจริง พร้อม Real-time IR Steering ─────────────────────
-        fwd_speed    = self.dashboard.move_speed     # m/s
-        target_dist  = config.STEP_DISTANCE_M        # 0.60 m
-        est_time     = target_dist / max(fwd_speed, 0.05)  # วินาที
-        poll_ms      = 0.06       # ตรวจ IR ทุก 60ms
-        tof_interval = 0.20       # ตรวจ ToF ทุก 200ms
-        lateral_corr = 0.07       # ความเร็วซ้าย/ขวา สำหรับ steer (m/s)
-
-        print(f"[Move] [FWD] เดินหน้า {target_dist*100:.0f} cm @ {fwd_speed:.2f} m/s พร้อม IR Steering → ({next_x},{next_y})")
-
-        if not self.use_mock and self.ep_robot:
-            start_t       = time.monotonic()
-            last_tof_chk  = 0.0
-            emergency_stop = False
-
-            try:
-                while True:
-                    elapsed = time.monotonic() - start_t
-
-                    # ─ หยุดเมื่อครบระยะ ─
-                    if elapsed >= est_time:
-                        break
-
-                    # ─ ตรวจ ToF ทุก 200ms (emergency front-wall check) ─
-                    if elapsed - last_tof_chk >= tof_interval:
-                        last_tof_chk = elapsed
-                        f_cm, f_wall = self.read_front_tof_quick()
-                        if f_wall:
-                            print(f"  [Steer] ⚠ EMERGENCY STOP — กำแพงหน้า! (ToF={f_cm:.1f}cm)")
-                            emergency_stop = True
-                            break
-
-                    # ─ อ่าน IR ซ้าย/ขวา แบบ single-sample (เร็ว ไม่ delay) ─
-                    lw, rw, l_io, r_io = self.read_ir_quick(num_samples=1)
-
-                    # ─ คำนวณ lateral correction ─
-                    vy = 0.0
-                    if lw and not rw:
-                        vy = -lateral_corr   # ซ้ายเจอกำแพง → ดันขวา (y ลบ)
-                        print(f"  [Steer] L=WALL → Steer Right (vy={vy:.2f})", end="\r")
-                    elif rw and not lw:
-                        vy = +lateral_corr   # ขวาเจอกำแพง → ดันซ้าย (y บวก)
-                        print(f"  [Steer] R=WALL → Steer Left  (vy={vy:.2f})", end="\r")
-
-                    # ─ สั่ง drive_speed ต่อเนื่อง ─
-                    self.ep_robot.chassis.drive_speed(x=fwd_speed, y=vy, z=0)
-                    time.sleep(poll_ms)
-
-            except Exception as e:
-                print(f"\n[Move] [ERROR] drive_speed error: {e}")
-                emergency_stop = True
-            finally:
-                # หยุดหุ่น
-                try:
-                    self.ep_robot.chassis.drive_speed(x=0, y=0, z=0)
-                    time.sleep(0.12)  # รอให้หยุดนิ่ง
-                except Exception:
-                    pass
-
-            if emergency_stop:
-                # อัปเดต MazeWalls ว่าด้านหน้ามีกำแพง
-                self.maze_walls.update_wall_sensor(
-                    self.robot_x, self.robot_y, card_dir, is_wall=True, weight=2.5)
-                # เรียกใช้ระบบหลีกเลี่ยงกำแพงฉุกเฉิน
-                if use_ir_avoidance:
-                    self.ir_wall_avoidance(reason="EMERGENCY_STOP")
-                return False
-        else:
-            # Mock mode: simulate time
-            time.sleep(est_time * 0.5)
-
-        # ─── อัปเดตตำแหน่งบน Map ────────────────────────────────────────────
-        self.robot_x = next_x
-        self.robot_y = next_y
-        self.path_history.append((self.robot_x, self.robot_y))
-
-        # Mark ทางที่เดินมา (Back wall ของ cell ใหม่) เป็น CLEAR เสมอ เพราะเพิ่งผ่านมา
-        back_dir = self._deg_to_cardinal((self.heading_deg + 180) % 360)
-        self.maze_walls.update_wall_sensor(
-            self.robot_x, self.robot_y, back_dir, is_wall=False, weight=2.0)
-
-        # สแกนและอัปเดตอัตโนมัติเมื่อถึงช่องใหม่
-        self.perform_scan_and_update(status_reason=reason)
-        return True
-
-    def move_backward_one_cell(self, reason="REVERSE"):
-        """ถอยหลัง 1 ช่อง (60 cm) โดยไม่หันกลับ เพื่อออกจากทางตันอย่างรวดเร็ว"""
-        dx, dy = 0, 0
-        norm_h = int(round(self.heading_deg / 90.0) * 90) % 360
-        # ถอยหลัง = เดินไปในทิศตรงข้ามของ Heading
-        if norm_h == 0:
-            dy = -1
-        elif norm_h == 90:
-            dx = -1
-        elif norm_h == 180:
-            dy = 1
-        elif norm_h == 270:
-            dx = 1
-
-        next_x = self.robot_x + dx
-        next_y = self.robot_y + dy
-
-        if not self.ogm.is_valid_cell(next_x, next_y):
-            print(f"[Move] [WARN] ไม่สามารถถอยหลังได้: ชนขอบเขตสนาม 4x4! (เป้าหมาย: {next_x}, {next_y})")
-            return False
-
-        current_speed = self.dashboard.move_speed
-        print(f"[Move] [BACKWARD] ถอยหลัง 1 ช่อง ({config.STEP_DISTANCE_M*100:.0f} cm) @ {current_speed:.2f} m/s ไปที่ ({next_x}, {next_y})...")
-
-        if not self.use_mock and self.ep_robot:
-            try:
-                # ถอยหลัง ให้ความเร็ว x เป็นลบ
-                self.ep_robot.chassis.move(
-                    x=-config.STEP_DISTANCE_M, y=0, z=0,
-                    xy_speed=current_speed
-                ).wait_for_completed()
-            except Exception as e:
-                print(f"[Move] [ERROR] ความผิดพลาดในการถอยหลัง: {e}")
-                return False
-        else:
-            time.sleep(config.STEP_DISTANCE_M / max(current_speed, 0.05) * 0.5)
-
-        self.robot_x = next_x
-        self.robot_y = next_y
-        self.path_history.append((self.robot_x, self.robot_y))
-
-        # หลังจากถอยหลังเสร็จแล้ว อัปเดตข้อมูลเซนเซอร์ในช่องใหม่
-        self.perform_scan_and_update(status_reason=reason)
-        return True
-
-    def _scan_unknown_sides_only(self, cell):
-        """
-        สแกนเฉพาะด้านที่ยังไม่รู้ค่ากำแพง (P ใกล้ 0.50):
-        หมุนไปยังทิศที่ Unknown เท่านั้น → ลดจำนวนการหมุนลง = เร็วขึ้น
-        """
-        orig_heading = self.heading_deg
-        cx, cy = cell
-
-        # หาทิศที่ยังไม่รู้
-        unknown_dirs = []
-        for d in ["NORTH", "EAST", "SOUTH", "WEST"]:
-            p = self.maze_walls.get_wall_prob(cx, cy, d)
-            if config.THRESHOLD_FREE < p < config.THRESHOLD_OCC:
-                unknown_dirs.append(d)
-
-        dir_to_deg = {"NORTH": 0, "EAST": 90, "SOUTH": 180, "WEST": 270}
-        print(f"  [SmartScan] \u0e2a\u0e41\u0e01\u0e19\u0e40\u0e09\u0e1e\u0e32\u0e30\u0e17\u0e34\u0e28\u0e17\u0e35\u0e48\u0e44\u0e21\u0e48\u0e23\u0e39\u0e49: {unknown_dirs}")
-
-        for target_dir in unknown_dirs:
-            target_hdg = dir_to_deg[target_dir]
-            # หมุนไปยังทิศที่ต้องการ
-            turns = 0
-            while self.heading_deg != target_hdg and turns < 4:
-                diff = (target_hdg - self.heading_deg) % 360
-                if diff == 90 or diff == 180:
-                    self.turn_right(reason=f"SMART_SCAN_{target_dir}", use_side_ir=False)
-                else:
-                    self.turn_left(reason=f"SMART_SCAN_{target_dir}", use_side_ir=False)
-                turns += 1
-            if not self.use_mock:
-                time.sleep(0.10)
-            self.perform_scan_and_update(status_reason=f"SMART_SCAN_{target_dir}", use_side_ir=False)
-
-        # หมุนกลับสู่ทิศเดิม
-        while self.heading_deg != orig_heading:
-            diff = (orig_heading - self.heading_deg) % 360
-            if diff == 90 or diff == 180:
-                self.turn_right(reason="SMART_SCAN_RETURN", use_side_ir=False)
-            else:
-                self.turn_left(reason="SMART_SCAN_RETURN", use_side_ir=False)
-
-        self.scanned_cells.add(cell)
-
-    def turn_left(self, reason="TURNED_LEFT", use_side_ir=True, do_scan=True):
-        """เลี้ยวซ้าย 90° ตามความเร็วหมุนใน Dashboard"""
-        current_turn_speed = self.dashboard.turn_speed
-        print(f"[Move] [TURN-L] กำลังเลี้ยวซ้าย 90° (ความเร็ว: {current_turn_speed:.1f} °/s)...")
-        if not self.use_mock and self.ep_robot:
-            try:
-                self.ep_robot.chassis.move(x=0, y=0, z=90, z_speed=current_turn_speed).wait_for_completed()
-                time.sleep(0.1)
-            except Exception as e:
-                print(f"[Move] [ERROR] ความผิดพลาดในการเลี้ยว: {e}")
-        else:
-            time.sleep(0.20)
-
-        self.heading_deg = (self.heading_deg - 90) % 360
-        print(f"[Move] ปัจจุบันหันหน้าทิศ Heading: {self.heading_deg}°")
-        if do_scan:
-            return self.perform_scan_and_update(status_reason=reason, use_side_ir=use_side_ir)
-        return None
-
-    def turn_right(self, reason="TURNED_RIGHT", use_side_ir=True, do_scan=True):
-        """เลี้ยวขวา 90° ตามความเร็วหมุนใน Dashboard"""
-        current_turn_speed = self.dashboard.turn_speed
-        print(f"[Move] [TURN-R] กำลังเลี้ยวขวา 90° (ความเร็ว: {current_turn_speed:.1f} °/s)...")
-        if not self.use_mock and self.ep_robot:
-            try:
-                self.ep_robot.chassis.move(x=0, y=0, z=-90, z_speed=current_turn_speed).wait_for_completed()
-                time.sleep(0.1)
-            except Exception as e:
-                print(f"[Move] [ERROR] ความผิดพลาดในการเลี้ยว: {e}")
-        else:
-            time.sleep(0.20)
-
-        self.heading_deg = (self.heading_deg + 90) % 360
-        print(f"[Move] ปัจจุบันหันหน้าทิศ Heading: {self.heading_deg}°")
-        if do_scan:
-            return self.perform_scan_and_update(status_reason=reason, use_side_ir=use_side_ir)
-        return None
-
-    def scan_cell_360(self, passes=None):
-        """
-        หมุนหุ่นยนต์สแกนตรวจสอบกำแพงรอบด้าน 360° แบบหลายรอบ (Multi-Pass Confirmation)
-        ตามที่ผู้ใช้ร้องขอ:
-        - แต่ละทิศทาง: ใช้เฉพาะ Front ToF ที่หันไปวัดระยะโดยตรง (ไม่ใช้ Side IR ที่อาจรบกวนค่า)
-        - ToF หยุดนิ่งแล้วอ่านค่าหลายครั้งพร้อม Median Filter
-        - หมุนตรวจสอบ 2 รอบ (Pass 1 และ Pass 2): เพื่อ Double-Check ป้องกันรายงานเจอกำแพงทั้งที่เป็นพื้นที่ว่าง
-        - เมื่อทั้ง 2 รอบยืนยันตรงกัน จึงสรุปผลกำแพงและอัปเดตลงทั้ง MazeWalls และ OGM
-        - หมุนกลับสู่ทิศทางเดิมเสมอ
-        """
-        if passes is None:
-            passes = getattr(self.dashboard, "scan_passes", 1)
-
-        cell = (self.robot_x, self.robot_y)
-        orig_heading = self.heading_deg
-        print("\n" + "=" * 65)
-        if passes == 1:
-            print(f"  [SCAN 360°] เริ่มหมุนกวาดเช็คกำแพง 1 รอบ (4 ทิศ) ณ ช่อง {cell} (Heading: {orig_heading}°)")
-        else:
-            print(f"  [SCAN 360°] เริ่มหมุนกวาดเช็คกำแพง {passes} รอบ ณ ช่อง {cell} (Heading: {orig_heading}°)")
-        print("=" * 65)
-
-        pass_results = []  # pass_results[pass_i][card_dir] = (dist_cm, is_wall)
-
-        for p_idx in range(1, passes + 1):
-            if passes > 1:
-                print(f"\n>>> [PASS {p_idx}/{passes}] กำลังสแกนรอบที่ {p_idx}...")
-            dir_data = {}
-
-            # ทิศที่ 1 (ทิศเริ่มต้น) - ใช้เฉพาะ Front ToF ตรงหน้า ไม่ใช้ Side IR รบกวน
-            if not self.use_mock:
-                time.sleep(0.15)
-            step_lbl = f"SCAN P{p_idx} [1/4]" if passes > 1 else "SCAN [1/4]"
-            d1 = self.perform_scan_and_update(status_reason=step_lbl, use_side_ir=False)
-            card1 = self._deg_to_cardinal(self.heading_deg)
-            f_cm1 = d1["front_dist_cm"] if d1 else 999.0
-            f_w1 = d1["front_is_wall"] if d1 else False
-            dir_data[card1] = (f_cm1, f_w1)
-            print(f"      [{card1:5s}] ToF: {f_cm1:5.1f} cm -> [{'WALL' if f_w1 else 'CLEAR'}]")
-
-            # ทิศที่ 2, 3, 4 (หมุนขวา 90° ทีละทิศ)
-            for step_i in range(2, 5):
-                turn_lbl = f"SCAN P{p_idx} [{step_i}/4]" if passes > 1 else f"SCAN [{step_i}/4]"
-                # 1. หมุนไปยังทิศถัดไปก่อน (ไม่ scan ทันทีซ้ำซ้อน)
-                self.turn_right(reason=turn_lbl, use_side_ir=False, do_scan=False)
-                if not self.use_mock:
-                    time.sleep(0.15)
-                # 2. อ่านค่า ToF หลังหมุนเสร็จแล้ว (heading อัปเดตแล้วแน่นอน)
-                card_i = self._deg_to_cardinal(self.heading_deg)
-                di = self.perform_scan_and_update(status_reason=f"{turn_lbl}_READ", use_side_ir=False)
-                f_cmi = di["front_dist_cm"] if di else 999.0
-                f_wi = di["front_is_wall"] if di else False
-                dir_data[card_i] = (f_cmi, f_wi)
-                print(f"      [{card_i:5s}] ToF: {f_cmi:5.1f} cm -> [{'WALL' if f_wi else 'CLEAR'}]")
-
-            # หมุนอีก 90° เพื่อกลับสู่ทิศเดิมของ Pass นี้
-            reset_lbl = f"SCAN P{p_idx} [RESET]" if passes > 1 else "SCAN [RESET]"
-            self.turn_right(reason=reset_lbl, use_side_ir=False, do_scan=False)
-            pass_results.append(dir_data)
-
-        # -----------------------------------------------------------------
-        # รวมผลและยืนยันค่ากำแพง (Verification / Summary)
-        # -----------------------------------------------------------------
-        print("\n" + "=" * 65)
-        if passes == 1:
-            print(f"  [SUMMARY] สรุปผลการตรวจกำแพง 4 ทิศ ณ ช่อง {cell}:")
-        else:
-            print(f"  [VERIFICATION SUMMARY] สรุปผลการตรวจกำแพง {passes} รอบ ณ ช่อง {cell}:")
-        print("=" * 65)
-
-        for d in ["NORTH", "EAST", "SOUTH", "WEST"]:
-            p1_dist, p1_wall = pass_results[0].get(d, (999.0, False))
-            if passes >= 2:
-                p2_dist, p2_wall = pass_results[1].get(d, (999.0, False))
-                confirmed_wall = (p1_wall and p2_wall)
-                status_str = "CONFIRMED WALL" if confirmed_wall else "CONFIRMED CLEAR"
-                print(f"  - {d:5s} : Pass1={p1_dist:5.1f}cm ({'WALL' if p1_wall else 'CLEAR'}) | Pass2={p2_dist:5.1f}cm ({'WALL' if p2_wall else 'CLEAR'})  ==> [{status_str}]")
-            else:
-                confirmed_wall = p1_wall
-                status_str = "WALL" if confirmed_wall else "CLEAR"
-                print(f"  - {d:5s} : ToF={p1_dist:5.1f} cm ==> [{status_str}]")
-
-            # คำนวณพิกัดช่องข้างเคียง
-            dx = 1 if d == "EAST" else -1 if d == "WEST" else 0
-            dy = 1 if d == "NORTH" else -1 if d == "SOUTH" else 0
-            nx = self.robot_x + dx
-            ny = self.robot_y + dy
-
-            # อัปเดตตารางกำแพง MazeWalls ด้วยค่าที่ผ่านการยืนยัน Double-Check
-            self.maze_walls.update_wall_sensor(self.robot_x, self.robot_y, d, is_wall=confirmed_wall, weight=3.0)
-
-            # อัปเดตแผนที่ตาราง OGM สำหรับช่องข้างเคียงโดยตรงด้วยค่าที่ยืนยันแล้ว
-            if self.ogm.is_valid_cell(nx, ny):
-                self.ogm.update_cell_status(nx, ny, is_occupied=confirmed_wall, weight=3.0)
-
-        # เซลล์ปัจจุบันที่หุ่นยนต์ยืนอยู่ต้องเป็น Free เสมอ
-        self.ogm.update_cell_status(self.robot_x, self.robot_y, is_occupied=False, weight=3.0)
-
-        self.scanned_cells.add(cell)
-        print("=" * 65 + "\n")
-        self.perform_scan_and_update(status_reason="SCAN_CONFIRMED", use_side_ir=False)
-
-    def run_auto_demonstration(self):
-        """
-        รันเส้นทางสำรวจตัวอย่างอัตโนมัติ:
-        (0,0) -> (0,1) -> (0,2) -> หมุนเลี้ยวขวา -> (1,2) -> (2,2) -> ...
-        """
-        print("\n" + "=" * 55)
-        print("  [AUTO] เริ่มต้นการทดลองสำรวจอัตโนมัติ (AUTO EXPLORATION)")
-        print("=" * 55)
-
-        commands = ["w", "w", "d", "w", "w", "d", "w", "a", "w"]
-        for cmd in commands:
-            print(f"\n[Auto Plan] กำลังรันคำสั่ง: {cmd.upper()}")
-            if cmd == "w":
-                self.move_forward_one_cell()
-            elif cmd == "a":
-                self.turn_left()
-            elif cmd == "d":
-                self.turn_right()
-            time.sleep(0.8)
-
-    def navigate_to_cell(self, target_x, target_y, reason="EXPLORING"):
-        """
-        หมุนหุ่นยนต์และก้าวเดินไปยังช่องเป้าหมาย (target_x, target_y)
-        ระบบ IR Avoidance ทำงานอัตโนมัติใน move_forward_one_cell:
-          - ถ้า IR ตรวจพบกำแพงด้านหน้าก่อนเดิน → ยกเลิก และรายงาน False
-          - Caller (run_autonomous_exploration) จะ trigger การ re-scan แล้วเลือกทางใหม่
-        """
-        dx = target_x - self.robot_x
-        dy = target_y - self.robot_y
-
-        target_heading = 0
-        if dx == 0 and dy == 1:
-            target_heading = 0     # North
-        elif dx == 1 and dy == 0:
-            target_heading = 90    # East
-        elif dx == 0 and dy == -1:
-            target_heading = 180   # South
-        elif dx == -1 and dy == 0:
-            target_heading = 270   # West
-
-        turn_diff = (target_heading - self.heading_deg) % 360
-        if turn_diff == 90:
-            self.turn_right(reason=f"{reason}_TURN_R", use_side_ir=True)
-        elif turn_diff == 270:
-            self.turn_left(reason=f"{reason}_TURN_L", use_side_ir=True)
-        elif turn_diff == 180:
-            # เป้าหมายอยู่ด้านหลัง → ถอยหลัง 1 ช่องโดยไม่ต้องหมุนตัว
-            return self.move_backward_one_cell(reason=reason)
-
-        # เดินไปข้างหน้า พร้อม IR avoidance real-time
-        success = self.move_forward_one_cell(reason=reason, use_ir_avoidance=True)
-
-        if not success:
-            # IR ตรวจพบกำแพง → ลบช่องนี้ออกจาก scanned_cells เพื่อบังคับ re-scan
-            current = (self.robot_x, self.robot_y)
-            if current in self.scanned_cells:
-                self.scanned_cells.discard(current)
-                print(f"[IR-Avoid] ล้าง scan cache ที่ {current} เพื่อบังคับ re-scan ใหม่")
-
-        return success
-
-    def run_autonomous_exploration(self, max_steps=50):
-        """
-        สำรวจเขาวงกตที่ไม่รู้แผนที่มาก่อนโดยอัตโนมัติ (Autonomous Exploration & Exit Finding)
-        เพื่อค้นหาทางออกเป้าหมาย (Exit Cell) พร้อมอัปเดต OGM และขอบกำแพงแบบ Real-time
-        """
         print("\n" + "=" * 60)
-        print("  [AUTONOMOUS EXPLORATION] เริ่มภารกิจสำรวจหาทางออกอัตโนมัติ")
-        print(f"  จุดเริ่มต้น: ({self.robot_x}, {self.robot_y}) ---> เป้าหมายทางออก (Exit): {self.explorer.exit_cell}")
+        print("  [AUTONOMOUS EXPLORATION] A* Matching occupancy_grid_mapping.py")
+        print(f"  Start: ({self.robot_x}, {self.robot_y}) -> Goal (G): {goal_cell}")
         print("=" * 60)
 
         step = 0
         while step < max_steps:
             step += 1
-            current = (self.robot_x, self.robot_y)
+            self.step_counter += 1
+            x, y = self.robot_x, self.robot_y
+            heading_idx = heading_deg_to_idx(self.heading_deg)
 
-            # ตรวจจับปุ่มกดคีย์บอร์ดหรือหน้าต่าง OpenCV เพื่อสั่งหยุดชั่วคราว
+            # Mark current cell as visited (sets to FREE)
+            self.ogm.mark_visited(x, y)
+
+            # Read sensors for logging/display (IR for steering only)
+            ir_l, ir_r, _, _ = self.read_ir_quick()
+            tof_f = self.sensor_mgr.sample_front_tof(num_samples=3, sample_interval=0.03) if self.sensor_mgr else 999.0
+            self.ogm.history.append(
+                f"Step {self.step_counter}: Pos=({x},{y}) Heading={self.heading_deg} | "
+                f"ToF={tof_f:.1f}cm | IR L={ir_l} R={ir_r} (Steering Only)"
+            )
+
+            # Print ASCII map
+            self.ogm.print_ascii_map(self.robot_x, self.robot_y, self.heading_deg)
+
+            # Check keyboard for stop
             k = cv2.waitKey(20) & 0xFF
             if k in [ord('q'), ord('Q'), 27]:
-                print("\n[AI Explorer] ผู้ใช้สั่งหยุดการสำรวจ (Paused/Stopped by user)")
+                print("\n[Explorer] User stopped exploration")
                 return False
 
-            # ซิงค์ Exit Cell หากผู้ใช้คลิกเปลี่ยนบน Dashboard
-            if self.explorer.exit_cell != self.dashboard.exit_cell:
-                print(f"[AI Explorer] ผู้ใช้เปลี่ยน Exit Cell เป็น {self.dashboard.exit_cell}")
-                self.explorer.set_exit_cell(self.dashboard.exit_cell)
+            # Sync goal cell if user clicked
+            if self.dashboard.goal_cell != goal_cell:
+                goal_cell = self.dashboard.goal_cell
+                print(f"[Explorer] Goal changed to {goal_cell}")
 
-            # ตรวจสอบว่าถึงทางออกหรือยัง
-            if self.explorer.is_at_exit(self.robot_x, self.robot_y):
-                print(f"\n[SUCCESS] ถึงเป้าหมายทางออกที่ {current} เรียบร้อยแล้ว! (ใช้ไป {step-1} ก้าว)")
-                self.perform_scan_and_update(status_reason=f"GOAL_REACHED at {current}")
-                return True
+            # ─── Phase 1: Explore ─────────────────────────────────────────
+            if not is_going_to_goal:
+                mode_lbl = "Exploration (A*)"
+                self.update_dashboard(mode_lbl)
 
-            # ─────────────────────────────────────────────────────────────────
-            # สแกน 360° เฉพาะเมื่อจำเป็น:
-            # ถ้าเพิ่งเดินเข้ามาจากทิศที่รู้แล้ว ทิศนั้น+ตรงข้ามรู้แล้ว
-            # → สแกนเฉพาะ 2 ด้านที่ยังไม่รู้ (หมุนน้อยลง = เร็วขึ้น)
-            # ─────────────────────────────────────────────────────────────────
-            if current not in self.scanned_cells:
-                # นับจำนวนด้านที่รู้ค่ากำแพงแน่ชัดแล้ว (P > 0.60 หรือ P < 0.40)
-                known_sides = 0
-                for chk_dir in ["NORTH", "EAST", "SOUTH", "WEST"]:
-                    p = self.maze_walls.get_wall_prob(current[0], current[1], chk_dir)
-                    if p >= config.THRESHOLD_OCC or p <= config.THRESHOLD_FREE:
-                        known_sides += 1
+                path = a_star_planner(self.ogm, x, y, heading_idx, target_mode="explore")
 
-                if known_sides >= 3:
-                    # รู้ 3 ด้านแล้ว → สแกนด้านที่ 4 เพียงด้านเดียว ไม่ต้องหมุน 360°
-                    print(f"[Explorer] ช่อง {current}: รู้ {known_sides}/4 ด้านแล้ว → อ่านเซนเซอร์ตรงหน้าเท่านั้น")
-                    self.perform_scan_and_update(status_reason="QUICK_SCAN", use_side_ir=True)
-                    self.scanned_cells.add(current)
-                elif known_sides >= 2:
-                    # รู้ 2 ด้าน → สแกนเฉพาะด้านที่ยังไม่รู้ ลดจาก 4 หมุน → 2 หมุน
-                    print(f"[Explorer] ช่อง {current}: รู้ {known_sides}/4 ด้านแล้ว → สแกนครึ่งรอบ (2 ทิศ)")
-                    self._scan_unknown_sides_only(current)
-                else:
-                    # ยังไม่รู้เลย → สแกนเต็ม 360° 1 รอบ
-                    print(f"[Explorer] ช่อง {current}: ยังไม่มีข้อมูล → สแกน 360° เต็มรอบ")
-                    self.scan_cell_360(passes=1)
+                if not path:
+                    print("\n[SUCCESS] All reachable cells explored! Navigating to Goal...")
+                    is_going_to_goal = True
 
-            next_cell, reason = self.explorer.decide_next_move(current, self.maze_walls)
-            print(f"\n[AI Explorer Step #{step}] ณ {current} -> ตัดสินใจ: {reason}")
+            # ─── Phase 2: Navigate to Goal ────────────────────────────────
+            if is_going_to_goal:
+                mode_lbl = "Navigate to Goal (A*)"
+                self.update_dashboard(mode_lbl)
 
-            if next_cell is None:
-                if reason == "GOAL_REACHED":
-                    print(f"\n[SUCCESS] บรรลุเป้าหมายทางออกเรียบร้อย!")
-                    self.perform_scan_and_update(status_reason=f"GOAL_REACHED at {current}")
+                if (x, y) == goal_cell:
+                    print(f"\n[MISSION COMPLETE] Arrived at Goal {goal_cell}!")
+                    self.update_dashboard("GOAL REACHED!")
                     return True
-                else:
-                    print(f"\n[AI Explorer] [WARN] สำรวจครบทุกช่องแล้ว ไม่สามารถเดินต่อได้: {reason}")
+
+                path = a_star_planner(self.ogm, x, y, heading_idx,
+                                      target_mode="goal", target_pos=goal_cell)
+                if not path:
+                    print(f"\n[ERROR] Cannot find path to Goal {goal_cell}!")
                     return False
 
-            # สั่งหุ่นยนต์เดินไปยังช่องถัดไป
-            success = self.navigate_to_cell(next_cell[0], next_cell[1], reason=reason)
-            if not success:
-                print(f"[AI Explorer] [WARN] ไม่สามารถเดินไป {next_cell} ได้ (พบสิ่งกีดขวาง)")
-                # ให้ AI ตัดสินใจใหม่ในรอบถัดไป
-                continue
+            # ─── Execute next step ─────────────────────────────────────────
+            next_node = path[1]
+            target_dir_idx = DIRS.index((next_node[0] - x, next_node[1] - y))
+            target_heading_deg = heading_idx_to_deg(target_dir_idx)
 
-            time.sleep(0.3)
+            # 1. Turn to face next_node
+            self.turn_to_heading(target_heading_deg)
+            self.update_dashboard(mode_lbl)
 
-        return self.explorer.is_at_exit(self.robot_x, self.robot_y)
+            # 2. Front ToF multi-round verify (ตัด noise ด้วย majority vote)
+            #    - รอ stabilize หลังหมุน 0.3 วินาที
+            #    - อ่าน 3 รอบ (แต่ละรอบ median 5 samples)
+            #    - Majority vote: wall >= 2/3 รอบ → wall, otherwise → clear
+            #    - ถ้า borderline (ค่าใกล้ threshold ±8cm) → อ่านเพิ่มอีก 2 รอบ ยืนยัน
+            if not self.use_mock:
+                time.sleep(0.3)  # Stabilization delay หลังหมุนเสร็จ
+
+            NUM_ROUNDS = 3
+            tof_readings = []
+            for rd in range(NUM_ROUNDS):
+                t = self.sensor_mgr.sample_front_tof(num_samples=5, sample_interval=0.03)
+                tof_readings.append(t)
+                if not self.use_mock:
+                    time.sleep(0.05)  # gap ระหว่าง round
+
+            wall_votes = sum(1 for t in tof_readings if t < config.WALL_DETECT_CM)
+            tof_median = sorted(tof_readings)[len(tof_readings) // 2]
+
+            # Borderline check: ถ้าค่าใกล้ threshold (±8cm) อ่านเพิ่มอีก 2 รอบ
+            borderline_low = config.WALL_DETECT_CM - 8.0
+            borderline_high = config.WALL_DETECT_CM + 8.0
+            if borderline_low < tof_median < borderline_high:
+                print(f"  [ToF] Borderline ({tof_median:.1f}cm ~{config.WALL_DETECT_CM}cm) -> extra 2 rounds...")
+                if not self.use_mock:
+                    time.sleep(0.15)
+                for rd in range(2):
+                    t = self.sensor_mgr.sample_front_tof(num_samples=5, sample_interval=0.03)
+                    tof_readings.append(t)
+                    if t < config.WALL_DETECT_CM:
+                        wall_votes += 1
+                    if not self.use_mock:
+                        time.sleep(0.05)
+                tof_median = sorted(tof_readings)[len(tof_readings) // 2]
+
+            total_rounds = len(tof_readings)
+            is_wall = wall_votes >= (total_rounds // 2 + 1)  # majority
+            tof_verify = tof_median
+
+            # 🛡️ Safety Override: ถ้ามีค่าใดอ่านได้ชิดมาก (<= 15.0cm เช่น 5.0cm)
+            # แสดงว่าเซนเซอร์อยู่ประชิดกำแพงจริง ห้ามหลงเชื่อค่า 999.0 (timeout/blind zone) เด็ดขาด!
+            if any(t <= 15.0 for t in tof_readings):
+                is_wall = True
+                tof_verify = min(tof_readings)
+                print(f"  [ToF Safety] ตรวจพบระยะชิดกำแพง ({tof_verify:.1f}cm <= 15cm) -> บังคับตัดสินเป็น WALL!")
+
+            print(f"  [ToF] {total_rounds} rounds: {[f'{t:.1f}' for t in tof_readings]} "
+                  f"-> median={tof_verify:.1f}cm, wall_votes={wall_votes}/{total_rounds} "
+                  f"-> {'WALL' if is_wall else 'CLEAR'}")
+
+            if is_wall:
+                # ─── WALL DETECTED ─────────────────────────────────────────
+                print(f"[WALL] ToF={tof_verify:.1f}cm -> Wall at {next_node}. "
+                      f"Recording edge & replanning...")
+                self.ogm.set_edge((x, y), next_node, -1)   # Wall!
+                self.ogm.update_cell(next_node[0], next_node[1], True)   # OCC
+                self.ogm.history.append(
+                    f"Step {self.step_counter}: BLOCKED ({x},{y})->{next_node} "
+                    f"ToF={tof_verify:.1f}cm votes={wall_votes}/{total_rounds}"
+                )
+                self.update_dashboard(f"WALL at {next_node}")
+                continue   # Replan immediately, don't move
+            else:
+                # ─── PATH CLEAR ────────────────────────────────────────────
+                print(f"[CLEAR] ToF={tof_verify:.1f}cm -> Open to {next_node}. Moving...")
+                self.ogm.set_edge((x, y), next_node, 1)   # Open!
+                self.move_forward_pid()
+                self.update_dashboard(mode_lbl)
+
+            time.sleep(0.2)
+
+        return (self.robot_x, self.robot_y) == goal_cell
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Results & Cleanup
+    # ══════════════════════════════════════════════════════════════════════
 
     def save_all_results(self):
-        """บันทึกผลลัพธ์ทั้งหมดลงไฟล์ในโฟลเดอร์ lab6"""
+        """Save all results to lab6 directory."""
         csv_file = os.path.join(current_dir, "ogm_result.csv")
         txt_file = os.path.join(current_dir, "ogm_log.txt")
         png_file = os.path.join(current_dir, "ogm_result.png")
 
         print("\n" + "=" * 55)
-        print("  [SAVE] กำลังบันทึกผลการทดลอง Lab 6...")
+        print("  [SAVE] Saving Lab 6 results...")
         print("=" * 55)
 
         self.ogm.save_to_csv(csv_file)
         self.ogm.save_log_file(txt_file)
-        self.ogm.save_plot_image(png_file, robot_path=self.path_history, maze_walls=self.maze_walls)
+        self.ogm.save_plot_image(png_file, robot_path=self.path_history)
 
-        print("\n[DONE] ผลลัพธ์ทั้งหมดถูกบันทึกเรียบร้อย:")
-        print(f"  1. ตารางความน่าจะเป็น CSV : {csv_file}")
-        print(f"  2. บันทึกผลการทดลอง TXT    : {txt_file}")
-        print(f"  3. แผนที่ความร้อน PNG      : {png_file}")
+        print(f"\n[DONE] Results saved:")
+        print(f"  1. CSV : {csv_file}")
+        print(f"  2. LOG : {txt_file}")
+        print(f"  3. PNG : {png_file}")
 
     def cleanup(self):
-        """ปิดการเชื่อมต่อหุ่นยนต์และปิดหน้าต่าง Dashboard อย่างปลอดภัย"""
+        """Close robot connection and dashboard."""
         self.dashboard.close()
         if self.ep_robot:
             try:
-                print("\n[Main] กำลังปิดการเชื่อมต่อกับ RoboMaster...")
-                # Unsubscribe sensor before close to avoid SDK __del__ error
+                print("\n[Main] Closing robot connection...")
                 try:
                     self.ep_robot.sensor.unsub_distance()
                 except Exception:
                     pass
+                try:
+                    self.ep_robot.chassis.unsub_attitude()
+                except Exception:
+                    pass
                 self.ep_robot.close()
-                print("[Main] ปิดการเชื่อมต่อเรียบร้อย")
+                print("[Main] Connection closed")
             except Exception:
                 pass
             finally:
@@ -888,37 +467,26 @@ class Lab6Experiment:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Lab 6: Occupancy Grid Mapping & Autonomous Exploration")
+    parser = argparse.ArgumentParser(description="Lab 6: OGM & A* Autonomous Exploration")
     parser.add_argument("--real", action="store_true", help="Run on real robot via Wi-Fi AP")
     parser.add_argument("--mock", action="store_true", help="Run in mock/simulation mode")
-    parser.add_argument("--auto", action="store_true", help="Run fixed auto demo sequence immediately")
-    parser.add_argument("--explore", action="store_true", help="Run autonomous maze exploration & exit finding")
     args = parser.parse_args()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # PHASE 1: Open Dashboard SETUP screen first.
-    # User picks: REAL ROBOT or SIMULATION, start cell, exit cell, speed.
-    # Robot mode (real/mock) is decided by button click — not by CLI flag.
-    # CLI flags --real / --mock are still accepted as shortcuts:
-    #   --real  -> pre-select REAL ROBOT mode
-    #   --mock  -> pre-select SIMULATION mode
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── PHASE 1: Setup Dashboard — pick mode, start, goal ─────────────────
     print("=" * 60)
     print("      LAB 6: OCCUPANCY GRID MAPPING (OGM) 4x4")
-    print("      RoboMaster EP -- Bayes' Rule & Autonomous Maze Exploration")
+    print("      A* Navigation matching occupancy_grid_mapping.py")
     print("=" * 60)
 
-    # Create a temporary dashboard just for setup (use_mock unknown yet)
-    setup_dash = __import__('dashboard').InteractiveDashboard()
-    # Pre-select mode if CLI flag given
+    setup_dash = InteractiveDashboard()
     if args.real:
         setup_dash.robot_mode = "REAL"
     elif args.mock:
         setup_dash.robot_mode = "MOCK"
     else:
-        setup_dash.robot_mode = None   # user must choose on screen
+        setup_dash.robot_mode = None
 
-    print("[Main] Dashboard SETUP — choose mode, start & exit, then press START")
+    print("[Main] Dashboard SETUP — choose mode, Start (S) & Goal (G), then press START")
     while True:
         setup_dash.render_setup()
         act = setup_dash.poll_action()
@@ -942,61 +510,43 @@ def main():
             return
 
     use_mock = (setup_dash.robot_mode == "MOCK")
-    print("[Main] Mode: %s" % ('SIMULATION' if use_mock else 'REAL ROBOT (Wi-Fi AP)'))
+    print("[Main] Mode: %s" % ('SIMULATION' if use_mock else 'REAL ROBOT'))
 
-    # Create main experiment with correct mode, copy setup choices
+    # ── Create experiment ─────────────────────────────────────────────────
     app = Lab6Experiment(use_mock=use_mock)
-    app.dashboard = setup_dash        # reuse the same window
-    app.explorer  = __import__('explorer').AutonomousExplorer(
-        exit_cell=setup_dash.exit_cell)
-
-    # Apply chosen start & exit cells
+    app.dashboard = setup_dash
     app.apply_setup_choices()
 
-    # ── PHASE 2: Connect robot ────────────────────────────────────────────────
+    # ── PHASE 2: Connect robot ────────────────────────────────────────────
     if not app.initialize_system():
-        print("[Main] [ERROR] ไม่สามารถเริ่มต้นระบบได้ ยกเลิกการทดลอง")
+        print("[Main] [ERROR] System init failed")
         app.dashboard.close()
         return
 
-    # ── PHASE 3: Initial Scan & Autonomous Exploration ───────────────────────
-    # หมุนสแกน 360° ตรวจสอบกำแพงรอบด้าน 4 ทิศ 1 รอบ ณ จุดเริ่มต้น
-    app.scan_cell_360(passes=1)
-
-    if args.auto:
-        app.run_auto_demonstration()
+    import signal
+    def safe_exit(sig, frame):
+        print("\n[WARN] Ctrl+C detected -> Saving...")
         app.save_all_results()
         app.cleanup()
-        return
+        sys.exit(0)
+    signal.signal(signal.SIGINT, safe_exit)
 
-    # เริ่มต้นเดินทางสำรวจเขาวงกตเพื่อหาทางออกโดยอัตโนมัติต่อเนื่องทันที
-    print("\n" + "=" * 65)
-    print("  [Main] เริ่มภารกิจเดินทางสำรวจหาทางออกอัตโนมัติ (Autonomous Exploration)...")
-    print("=" * 65)
+    # ── PHASE 3: A* Autonomous Exploration ────────────────────────────────
+    app.update_dashboard("STARTING...")
     app.run_autonomous_exploration()
     app.save_all_results()
 
-    # Interactive Command Loop (สามารถควบคุมต่อด้วยปุ่ม หรือกด Q เพื่อจบโปรแกรม)
+    # ── Interactive Command Loop ──────────────────────────────────────────
     print("\n" + "-" * 60)
-    print("  [Main] ภารกิจสำรวจเสร็จสิ้น! คุณสามารถสั่งการต่อ หรือกด [Q / ESC] เพื่อปิดโปรแกรม:")
-    print("    - [W] เดินหน้า 1 ช่อง | [A] เลี้ยวซ้าย | [D] เลี้ยวขวา | [S] สแกน 360°")
-    print("    - [E] สั่ง AI สำรวจต่อ | [P] บันทึกผลลัพธ์ | [Q / ESC] จบการทดลอง")
-    print("-" * 60 + "\n")
-    print("        [W]       : เดินหน้า 1 ช่อง (60 cm)")
-    print("        [A]       : หมุนเลี้ยวซ้าย 90°")
-    print("        [D]       : หมุนเลี้ยวขวา 90°")
-    print("        [S]       : หมุนสแกนกำแพงรอบช่อง 360° (Full 360° Wall Scan)")
-    print("        [E]       : ให้หุ่นสำรวจเขาวงกตเพื่อหาทางออกเองอัตโนมัติ")
-    print("        [AUTO]    : รันเส้นทางสำรวจตัวอย่างอัตโนมัติ")
-    print("        [P]       : พล็อตและบันทึกผลแผนที่ทันที")
-    print("        [Q / ESC] : จบการทดลองและบันทึกผลลัพธ์ทั้งหมด")
+    print("  [Main] Exploration complete! Manual control available:")
+    print("    [W] Forward | [A] Turn L | [D] Turn R | [E] Explore again")
+    print("    [P] Save | [Q / ESC] Quit")
     print("-" * 60 + "\n")
 
     import msvcrt
 
     try:
         while True:
-            # 1. ตรวจสอบ Action ที่คลิกผ่านปุ่มบนหน้าจอ Dashboard
             btn_act = app.dashboard.poll_action()
             cmd = None
 
@@ -1009,15 +559,11 @@ def main():
                     cmd = "a"
                 elif btn_act == "BTN_TURN_R":
                     cmd = "d"
-                elif btn_act == "BTN_SCAN":
-                    cmd = "s"
                 elif btn_act == "BTN_SAVE":
                     cmd = "p"
-                elif btn_act.startswith("SET_EXIT_"):
-                    # Refresh dashboard to highlight new Exit cell
-                    app.perform_scan_and_update(status_reason=f"TARGET_CHANGED -> {app.dashboard.exit_cell}")
+                elif btn_act.startswith("SET_GOAL_"):
+                    app.update_dashboard(f"Goal changed -> {app.dashboard.goal_cell}")
 
-            # 2. ตรวจสอบปุ่มกดจากหน้าต่าง OpenCV Dashboard
             k = cv2.waitKey(25) & 0xFF
             if k in [ord('w'), ord('W')]:
                 cmd = "w"
@@ -1025,50 +571,69 @@ def main():
                 cmd = "a"
             elif k in [ord('d'), ord('D')]:
                 cmd = "d"
-            elif k in [ord('s'), ord('S')]:
-                cmd = "s"
             elif k in [ord('e'), ord('E')]:
                 cmd = "e"
             elif k in [ord('p'), ord('P')]:
                 cmd = "p"
-            elif k in [ord('q'), ord('Q'), 27]: # 27 = ESC
+            elif k in [ord('q'), ord('Q'), 27]:
                 cmd = "q"
 
-            # 3. ตรวจสอบปุ่มกดจาก Terminal (Non-blocking)
             if cmd is None and msvcrt.kbhit():
                 try:
                     ch = msvcrt.getch().decode("utf-8", errors="ignore").lower()
-                    if ch in ["w", "a", "d", "s", "e", "p", "q"]:
+                    if ch in ["w", "a", "d", "e", "p", "q"]:
                         cmd = ch
                 except Exception:
                     pass
 
-            # 4. ประมวลผลคำสั่ง
             if cmd == "w":
-                app.move_forward_one_cell()
+                # Manual forward: check ToF first
+                heading_idx = heading_deg_to_idx(app.heading_deg)
+                nx = app.robot_x + DIRS[heading_idx][0]
+                ny = app.robot_y + DIRS[heading_idx][1]
+                tof = app.sensor_mgr.sample_front_tof(num_samples=3, sample_interval=0.03)
+                if tof < config.WALL_DETECT_CM:
+                    print(f"[Manual] Wall ahead (ToF={tof:.1f}cm)")
+                    app.ogm.set_edge((app.robot_x, app.robot_y), (nx, ny), -1)
+                else:
+                    app.ogm.set_edge((app.robot_x, app.robot_y), (nx, ny), 1)
+                    app.move_forward_pid()
+                    app.ogm.mark_visited(app.robot_x, app.robot_y)
+                app.update_dashboard("Manual Control")
             elif cmd == "a":
-                app.turn_left()
+                app.heading_deg = (app.heading_deg - 90) % 360
+                if not app.use_mock and app.ep_robot:
+                    try:
+                        app.ep_robot.chassis.move(x=0, y=0, z=90, z_speed=app.dashboard.turn_speed).wait_for_completed()
+                    except Exception:
+                        pass
+                app.update_dashboard("Manual Control")
             elif cmd == "d":
-                app.turn_right()
-            elif cmd == "s":
-                app.scan_cell_360()
+                app.heading_deg = (app.heading_deg + 90) % 360
+                if not app.use_mock and app.ep_robot:
+                    try:
+                        app.ep_robot.chassis.move(x=0, y=0, z=-90, z_speed=app.dashboard.turn_speed).wait_for_completed()
+                    except Exception:
+                        pass
+                app.update_dashboard("Manual Control")
             elif cmd == "e":
                 app.run_autonomous_exploration()
+                app.save_all_results()
             elif cmd == "p":
                 app.save_all_results()
             elif cmd == "q":
-                print("\n[Main] กำลังจบการทดลอง...")
+                print("\n[Main] Ending experiment...")
                 break
 
             time.sleep(0.02)
 
     except KeyboardInterrupt:
-        print("\n[Main] ตรวจพบการกด Ctrl+C ยุติการทดลอง...")
+        print("\n[Main] Ctrl+C detected")
 
     finally:
         app.save_all_results()
         app.cleanup()
-        print("\n[DONE] การทดลอง Lab 6 เสร็จสมบูรณ์แล้ว!")
+        print("\n[DONE] Lab 6 complete!")
 
 
 if __name__ == "__main__":

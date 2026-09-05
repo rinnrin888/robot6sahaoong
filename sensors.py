@@ -44,6 +44,9 @@ class SensorManager:
         self._tof_lock = threading.Lock()
         self.tof_ready = threading.Event()
 
+        # IMU Attitude state (Yaw in degrees)
+        self._current_yaw = 0.0
+
         # ตำแหน่งล่าสุดของหุ่น (ใช้ใน mock mode ให้ read_front_tof / sample_front_tof รู้ทิศ)
         self._mock_rx = 0
         self._mock_ry = 0
@@ -234,11 +237,32 @@ class SensorManager:
             l_io, _ = self.read_left_io()
             r_io, _ = self.read_right_io()
             print("[IR] [OK] Left IO=%d  Right IO=%d" % (l_io, r_io))
+
+            # Subscribe attitude for IMU Yaw PID heading stabilization
+            try:
+                self.ep_robot.chassis.sub_attitude(freq=config.CONTROL_FREQ_HZ, callback=self._imu_callback)
+                print("[IMU] [OK] Attitude subscription ready.")
+            except Exception as e:
+                print(f"[IMU] [WARN] sub_attitude failed: {e}")
+
             return True
 
         except Exception as e:
             print("[Sensors] [ERROR] Hardware setup failed: %s" % e)
             return False
+
+    # ----------------------------------------------------------------
+    # IMU attitude callback
+    # ----------------------------------------------------------------
+    def _imu_callback(self, sub_info):
+        if sub_info and len(sub_info) > 0:
+            self._current_yaw = sub_info[0]
+
+    def get_current_yaw(self):
+        """คืนค่ามุม Yaw ปัจจุบัน (°): จาก IMU จริง หรือ mock heading"""
+        if self.mock:
+            return float(self._mock_heading)
+        return self._current_yaw
 
     # ----------------------------------------------------------------
     # ToF callback
@@ -250,15 +274,18 @@ class SensorManager:
         now = time.monotonic()
         with self._tof_lock:
             self._last_tof_time = now
-            # ในเซนเซอร์ RoboMaster ToF:
-            # val_mm == 0 หมายถึงไม่มีแสงสะท้อนกลับมา (พื้นที่ว่าง / ระยะไกลเกิน 2 เมตร)
-            # 20 < val_mm < 5000 คือระยะสิ่งกีดขวางที่ตรวจพบจริง
-            if val_mm == 0 or val_mm >= 5000:
-                self._front_dist_cm = 999.0
-            elif val_mm > 20:
-                self._front_dist_cm = float(val_mm) / 10.0
+            # RoboMaster ToF sensor interpretation:
+            # - val_mm == 0 หรือ val_mm < 60: ชิดกำแพงมาก / จุดบอดเซนเซอร์ (Blind zone < 6cm)
+            #   **สำคัญมาก**: val_mm == 0 เกิดเมื่อวัตถุอยู่ชิดเซนเซอร์มากจนสะท้อนไม่ทัน (Blind zone)
+            #   ห้ามแปลงเป็น 999.0 เด็ดขาด! ต้องเป็น 5.0cm (WALL ชัวร์)
+            # - val_mm >= 3000: ไม่มีสิ่งกีดขวางในระยะตรวจจับ -> 999.0 (ทางโล่ง)
+            # - 60 <= val_mm < 3000: ระยะปกติ -> แปลงเป็น cm
+            if val_mm < 60:
+                self._front_dist_cm = 5.0     # ชิดกำแพงมาก = WALL ชัวร์!
+            elif val_mm >= 3000:
+                self._front_dist_cm = 999.0   # ทางโล่งไกล
             else:
-                self._front_dist_cm = 999.0
+                self._front_dist_cm = float(val_mm) / 10.0
 
             self._tof_raw_samples.append((now, self._front_dist_cm))
             if len(self._tof_raw_samples) > 30:

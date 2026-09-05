@@ -40,7 +40,7 @@ GIMBAL_SPEED     = 80        # ความเร็วในการเคล�
 # ระยะการตรวจจับของ ToF (cm)
 TOF_OFFSET_CM    = 8.5       # ระยะห่างหัว ToF จากจุดศูนย์กลางหุ่น
 TOF_MAX_RANGE_CM = 150.0     # ระยะตรวจจับสูงสุดที่เชื่อถือได้
-WALL_DETECT_CM   = 40.0      # ระยะตรวจจับกำแพง: mock คืน ~35cm (wall) / ~95cm (clear); real: ขอบช่องถัดไป ~60cm
+WALL_DETECT_CM   = 30.0      # เกณฑ์ตรวจจับกำแพง (ToF Raw): < 30cm = WALL (ขอบช่องปัจจุบัน ~21.5cm); >= 30cm = CLEAR (ช่องถัดไป ~81.5cm)
 
 # =============================================================================
 #  DIGITAL IR OBSTACLE SENSORS (I/O) — LEFT & RIGHT
@@ -63,3 +63,8 @@ STEP_DISTANCE_M  = 0.60      # ระยะก้าว 1 ช่อง = 60 cm (
 TURN_SPEED_DPS   = 45.0      # ความเร็วหมุนเลี้ยว (°/s)
 CONTROL_FREQ_HZ  = 20        # ความถี่ในการควบคุม (Hz)
 CONN_TYPE        = "ap"      # ประเภทการเชื่อมต่อ Wi-Fi: "ap" หรือ "sta"
+
+# PID Attitude (Yaw) & Lateral Parameters (from occupancy_grid_mapping.py)
+KP_YAW           = 1.4       # Proportional gain สำหรับล็อกหัวหุ่นตรง
+KD_YAW           = 0.08      # Derivative gain ป้องกันการส่าย
+MAX_CORRECTION_Y = 0.20      # ความเร็วเบี่ยงข้างสูงสุด (m/s)
